@@ -489,9 +489,9 @@ function tallySendResults() {
   sysSheet.getRange('A1').setValue(true);
   SpreadsheetApp.flush();
 
-  // 高速モードの場合のみバッチ処理トリガーを自動解除
-  if (settings.mode === '高速モード') {
-    try { stopVotingTrigger(); } catch (e) {}
+  // 高速モードかつトリガーが存在する場合のみバッチ処理トリガーを自動解除
+  if (settings.mode === '高速モード' && _triggerExists('processVoteBuffer')) {
+    _deleteTriggersByName('processVoteBuffer');
   }
 
   Logger.log('集計・通知が完了しました。\n' + body);
@@ -539,12 +539,24 @@ function startVotingTrigger() {
 }
 
 function stopVotingTrigger() {
-  var functionName = 'processVoteBuffer';
-  var deletedCount = _deleteTriggersByName(functionName);
-  try {
-    if (deletedCount > 0) SpreadsheetApp.getUi().alert('【投票終了】\nバッチ処理トリガーを停止しました。');
-    else SpreadsheetApp.getUi().alert('稼働中のバッチ処理トリガーは見つかりませんでした。');
-  } catch (e) {} // トリガーからの自動解除時はUIを出さない
+  var exists = _triggerExists('processVoteBuffer');
+  if (!exists) {
+    try { SpreadsheetApp.getUi().alert('稼働中のバッチ処理トリガーは見つかりませんでした。'); } catch (e) {}
+    return;
+  }
+  _deleteTriggersByName('processVoteBuffer');
+  try { SpreadsheetApp.getUi().alert('【投票終了】\nバッチ処理トリガーを停止しました。'); } catch (e) {}
+}
+
+/**
+ * 指定した関数名のトリガーが存在するか確認する。
+ */
+function _triggerExists(functionName) {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === functionName) return true;
+  }
+  return false;
 }
 
 function _deleteTriggersByName(functionName) {
