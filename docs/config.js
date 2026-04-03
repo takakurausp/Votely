@@ -3,4 +3,4 @@
 // GASをデプロイしたあと、GAS_URL をデプロイURLに更新してください。
 // 例: var GAS_URL = 'https://script.google.com/macros/s/XXXXXXXXXXXXXXXX/exec';
 // =============================================================================
-var GAS_URL = 'ここにGASのデプロイURLを貼り付けてください';
+var GAS_URL = 'https://script.google.com/macros/s/AKfycbwGZPnekb7SeaGoM-VDtQ2t-nHPHEY3OkgtcnrMj7brLP5chBolwEFETwvUVfuOZh8k/exec';
