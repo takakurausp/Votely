@@ -71,8 +71,16 @@ function initializeSystem() {
     settingsSheet.getRange('B1').setValue('投票タイトル（例: 懇親会の場所）');
     settingsSheet.getRange('B2').setValue('選択肢A');
     settingsSheet.getRange('B3').setValue('選択肢B');
-    settingsSheet.setColumnWidth(1, 300); 
+    settingsSheet.setColumnWidth(1, 300);
   }
+
+  // A6セルにプルダウン（データ検証）を設定（初回・再実行どちらでも適用）
+  var modeRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(['通常モード', '高速モード'], true)
+    .setAllowInvalid(false)
+    .setHelpText('通常モード（小〜中規模）または 高速モード（大規模一斉投票）を選択してください。')
+    .build();
+  settingsSheet.getRange('A6').setDataValidation(modeRule);
 
   // 2. 名簿とトークンシート
   var rosterSheet = getOrCreateSheet(SHEET_ROSTER);
@@ -433,7 +441,12 @@ function tallySendResults() {
   });
 
   var totalVotes = 0;
-  var allData = ballotSheet.getRange(1, 1, lastRow, numVotes + 1).getValues();
+  var dataRows = lastRow - 1; // ヘッダー行を除く
+  if (dataRows < 1) {
+    try { SpreadsheetApp.getUi().alert('投票データがまだありません。'); } catch (e) {}
+    return;
+  }
+  var allData = ballotSheet.getRange(2, 1, dataRows, numVotes + 1).getValues();
 
   allData.forEach(function(rowData) {
     if (!rowData[0]) return; 
@@ -476,12 +489,17 @@ function tallySendResults() {
   sysSheet.getRange('A1').setValue(true);
   SpreadsheetApp.flush();
 
-  // バッチ処理トリガーを自動解除
-  try { stopVotingTrigger(); } catch (e) {}
+  // 高速モードの場合のみバッチ処理トリガーを自動解除
+  if (settings.mode === '高速モード') {
+    try { stopVotingTrigger(); } catch (e) {}
+  }
 
   Logger.log('集計・通知が完了しました。\n' + body);
   try {
-    SpreadsheetApp.getUi().alert('集計・結果通知が完了しました。バッチ処理も停止しました。\n\n' + body);
+    var doneMsg = settings.mode === '高速モード'
+      ? '集計・結果通知が完了しました。バッチ処理も停止しました。\n\n' + body
+      : '集計・結果通知が完了しました。\n\n' + body;
+    SpreadsheetApp.getUi().alert(doneMsg);
   } catch (e) {}
 }
 
