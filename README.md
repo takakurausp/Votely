@@ -4,8 +4,8 @@ Votely は、**Googleスプレッドシート + Google Apps Script + GitHub Page
 
 - 投票者は**専用URL**をクリックするだけで投票できます（アプリのインストール不要）
 - 投票結果は**匿名**で処理されます（誰が何に投票したかは記録されません）
-- **どのGoogleアカウントでログインしていても**同じURLで投票できます
 - 複数の投票項目にも対応しています
+- より大規模（1000人以上）な投票には、Google Formを利用した[Votely Form](https://github.com/takakurausp/Votely_Form)のご利用をおすすめします。
 
 ---
 
