@@ -1,6 +1,7 @@
 // =============================================================================
 // Votely 設定ファイル
-// GASをデプロイしたあと、GAS_URL をデプロイURLに更新してください。
-// スプレッドシートIDは環境変数（スクリプトプロパティ）で管理します。
+// GASをデプロイしたあと、GAS_URL をデプロイURLに書き換えてください。
+// 例: https://script.google.com/macros/s/XXXXXXXXXXXXXXXX/exec
+// ⚠️ 本番URLをそのままコミットしないようご注意ください。
 // =============================================================================
-var GAS_URL = 'https://script.google.com/macros/s/AKfycbwGZPnekb7SeaGoM-VDtQ2t-nHPHEY3OkgtcnrMj7brLP5chBolwEFETwvUVfuOZh8k/exec';
+var GAS_URL = 'https://script.google.com/macros/s/XXXXXXXXXXXXXXXX/exec';

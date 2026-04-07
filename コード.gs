@@ -35,6 +35,8 @@ function onOpen() {
     .addSeparator()
     .addItem('⑤ 集計・結果通知（手動実行）', 'tallySendResults')
     .addItem('⑥ 締め切りトリガーをセットアップ', 'setupTrigger')
+    .addSeparator()
+    .addItem('⑦ 🎫 当日参加者用チケット一括発行（PDF印刷）', 'generateGuestTickets')
     .addToUi();
 }
 
@@ -693,6 +695,212 @@ function _batchUpdateRosterVotedFlags(ss, votedTokens) {
   if (isUpdated) {
     votedRange.setValues(votedValues);
   }
+}
+
+// =============================================================================
+// 機能E: 当日参加者用チケット一括発行（PDF印刷）
+// =============================================================================
+
+/**
+ * 当日参加者用のトークンを N 件まとめて発行し、QRコード付きのチケットを
+ * モーダルダイアログに表示する。ユーザーはブラウザの「PDFとして保存／印刷」で
+ * A4 用紙に 10 枚（5 行 × 2 列）レイアウトで出力できる。
+ *
+ * 名簿シートには「guest_001」「guest_002」のような連番ラベルで追記される。
+ * 既存の guest_NNN を走査して、最大値+1 から続きの番号を採番する。
+ */
+function generateGuestTickets() {
+  var html = HtmlService.createHtmlOutput(_buildGuestTicketsDialogHtml())
+    .setWidth(640)
+    .setHeight(640);
+  SpreadsheetApp.getUi().showModalDialog(html, '🎫 当日参加者用チケット一括発行');
+}
+
+/**
+ * モーダル側の JavaScript から google.script.run 経由で呼ばれるサーバーハンドラ。
+ * トークンを発行し、名簿に一括追記し、印刷用データを返す。
+ */
+function createGuestTickets(params) {
+  var num = parseInt(params && params.num, 10);
+  if (!num || num <= 0) throw new Error('発行枚数は1以上の整数を指定してください。');
+  if (num > 200) throw new Error('一度に生成できるのは200枚までです。');
+
+  var title = String(params.title || 'Votely 投票チケット');
+  var desc  = String(params.desc  || '');
+
+  var settings = _getSettings();
+  var pagesUrl = settings.pagesUrl || settings.appUrl;
+  if (!pagesUrl) {
+    throw new Error('設定シートの A5（または A4）に投票画面URLを設定してください。');
+  }
+
+  if (settings.deadline && new Date() > new Date(settings.deadline)) {
+    throw new Error('投票の締め切りを過ぎています。チケットを発行できません。');
+  }
+
+  var deadlineStr = settings.deadline
+    ? Utilities.formatDate(new Date(settings.deadline), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm')
+    : '';
+
+  var ss          = SpreadsheetApp.getActiveSpreadsheet();
+  var rosterSheet = ss.getSheetByName(SHEET_ROSTER);
+
+  // 既存の guest_NNN を走査して、続きの番号から採番する
+  var startNum = _getNextGuestNumber(rosterSheet);
+  var base     = String(pagesUrl).replace(/\/$/, '');
+
+  var rows    = [];
+  var tickets = [];
+  for (var i = 0; i < num; i++) {
+    var n       = startNum + i;
+    var label   = 'guest_' + _padNum(n, 3);
+    var token   = Utilities.getUuid();
+    var voteUrl = base + '/index.html?token=' + token;
+    rows.push([label, token, voteUrl, false]);
+    tickets.push({ label: label, token: token, url: voteUrl });
+  }
+
+  // 名簿に一括追記（appendRow ループより速く、ロック競合も少ない）
+  var startRow = rosterSheet.getLastRow() + 1;
+  rosterSheet.getRange(startRow, 1, rows.length, 4).setValues(rows);
+  SpreadsheetApp.flush();
+
+  return {
+    tickets:  tickets,
+    title:    title,
+    desc:     desc,
+    deadline: deadlineStr
+  };
+}
+
+/**
+ * 名簿シートの A 列を走査して「guest_NNN」形式の最大番号 + 1 を返す。
+ * 1 件もなければ 1 を返す。
+ */
+function _getNextGuestNumber(rosterSheet) {
+  var lastRow = rosterSheet.getLastRow();
+  if (lastRow < 2) return 1;
+  var values = rosterSheet.getRange(2, COL_EMAIL, lastRow - 1, 1).getValues();
+  var max = 0;
+  for (var i = 0; i < values.length; i++) {
+    var m = String(values[i][0]).match(/^guest_(\d+)$/);
+    if (m) {
+      var n = parseInt(m[1], 10);
+      if (n > max) max = n;
+    }
+  }
+  return max + 1;
+}
+
+function _padNum(n, w) {
+  var s = String(n);
+  while (s.length < w) s = '0' + s;
+  return s;
+}
+
+/**
+ * チケット発行モーダルの HTML を組み立てる。
+ * - 上部: 入力フォーム（タイトル / 説明 / 枚数）と「発行」ボタン
+ * - 下部: 発行後にチケットを 2 列グリッドで描画（QR は api.qrserver.com を使用）
+ * - @media print で印刷時はフォーム部分を隠して A4 レイアウトに整える
+ */
+function _buildGuestTicketsDialogHtml() {
+  return [
+    '<!doctype html><html lang="ja"><head><meta charset="utf-8"><style>',
+    'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;padding:14px;font-size:13px;color:#212529;}',
+    'h2{margin:0 0 10px;font-size:15px;color:#0d6efd;}',
+    'label{display:block;margin:8px 0 3px;font-weight:600;}',
+    'input[type=text],input[type=number]{width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #ced4da;border-radius:4px;font-size:13px;}',
+    'button{margin-top:12px;padding:8px 18px;background:#0d6efd;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:600;}',
+    'button.print{background:#28a745;}',
+    'button:disabled{background:#999;cursor:wait;}',
+    '#status{color:#0d6efd;font-weight:600;margin-top:10px;min-height:1em;}',
+    '#err{color:#dc3545;margin-top:6px;min-height:1em;}',
+    '#result{margin-top:14px;display:none;}',
+    '.tickets{display:grid;grid-template-columns:1fr 1fr;gap:6mm;margin-top:10px;}',
+    '.ticket{border:1px solid #999;padding:5mm;display:flex;justify-content:space-between;align-items:flex-start;break-inside:avoid;background:#fff;}',
+    '.ticket .info{flex:1;padding-right:3mm;min-width:0;}',
+    '.ticket .t-title{font-size:11pt;font-weight:700;margin:0 0 2mm;line-height:1.25;}',
+    '.ticket .t-desc{font-size:8pt;margin:0 0 2mm;color:#333;line-height:1.3;}',
+    '.ticket .t-deadline{font-size:8pt;color:#c0392b;margin:0 0 2mm;}',
+    '.ticket .t-no{font-size:7pt;color:#555;margin:2mm 0 0;}',
+    '.ticket .t-token{font-size:5.5pt;color:#888;word-break:break-all;margin:0;}',
+    '.ticket img{width:30mm;height:30mm;flex-shrink:0;}',
+    '@media print {',
+    '  body{padding:0;}',
+    '  .form-area{display:none !important;}',
+    '  #result{display:block !important;margin:0;}',
+    '  .tickets{gap:4mm;}',
+    '  .ticket{page-break-inside:avoid;}',
+    '  button.print{display:none;}',
+    '  @page{size:A4;margin:8mm;}',
+    '}',
+    '</style></head><body>',
+    '<div class="form-area">',
+    '<h2>🎫 当日参加者チケット一括発行</h2>',
+    '<label>チケットタイトル</label>',
+    '<input type="text" id="title" value="Votely 投票チケット">',
+    '<label>説明文</label>',
+    '<input type="text" id="desc" value="QRコードを読み取って投票してください">',
+    '<label>発行枚数（1〜200）</label>',
+    '<input type="number" id="num" value="10" min="1" max="200">',
+    '<button id="genBtn" onclick="onGenerate()">トークン発行＆チケット表示</button>',
+    '<p id="status"></p>',
+    '<p id="err"></p>',
+    '</div>',
+    '<div id="result">',
+    '<button class="print" onclick="window.print()">🖨 PDFとして保存／印刷</button>',
+    '<div class="tickets" id="ticketsBox"></div>',
+    '</div>',
+    '<script>',
+    'function escapeHtml(s){',
+    '  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/\'/g,"&#039;");',
+    '}',
+    'function onGenerate(){',
+    '  var btn=document.getElementById("genBtn");',
+    '  var status=document.getElementById("status");',
+    '  var err=document.getElementById("err");',
+    '  err.textContent="";',
+    '  btn.disabled=true;status.textContent="生成中...";',
+    '  var params={',
+    '    num:document.getElementById("num").value,',
+    '    title:document.getElementById("title").value,',
+    '    desc:document.getElementById("desc").value',
+    '  };',
+    '  google.script.run',
+    '    .withSuccessHandler(function(data){',
+    '      btn.disabled=false;status.textContent="";',
+    '      render(data);',
+    '    })',
+    '    .withFailureHandler(function(e){',
+    '      btn.disabled=false;status.textContent="";',
+    '      err.textContent="エラー: "+(e && e.message ? e.message : e);',
+    '    })',
+    '    .createGuestTickets(params);',
+    '}',
+    'function render(data){',
+    '  var box=document.getElementById("ticketsBox");',
+    '  box.innerHTML="";',
+    '  data.tickets.forEach(function(t){',
+    '    var qr="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data="+encodeURIComponent(t.url);',
+    '    var html=',
+    '      \'<div class="ticket">\'+',
+    '        \'<div class="info">\'+',
+    '          \'<p class="t-title">\'+escapeHtml(data.title)+\'</p>\'+',
+    '          (data.desc?\'<p class="t-desc">\'+escapeHtml(data.desc)+\'</p>\':"")+',
+    '          (data.deadline?\'<p class="t-deadline">締切: \'+escapeHtml(data.deadline)+\'</p>\':"")+',
+    '          \'<p class="t-no">No: \'+escapeHtml(t.label)+\'</p>\'+',
+    '          \'<p class="t-token">Token: \'+escapeHtml(t.token)+\'</p>\'+',
+    '        \'</div>\'+',
+    '        \'<img src="\'+qr+\'" alt="QR">\'+',
+    '      \'</div>\';',
+    '    box.insertAdjacentHTML("beforeend",html);',
+    '  });',
+    '  document.getElementById("result").style.display="block";',
+    '}',
+    '</script>',
+    '</body></html>'
+  ].join('\n');
 }
 
 // =============================================================================
