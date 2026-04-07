@@ -219,9 +219,41 @@ function generateTokensOnly() {
 // 機能B: 事務局ポータル
 // =============================================================================
 
+/**
+ * 事務局パスワードを検証する。
+ * 失敗回数を CacheService で数え、5 回失敗で 5 分間ロックアウトする。
+ * GAS は IP を取れないため、ロックアウトはスクリプト全体に対するグローバルなもの。
+ * 正しいパスワードでログイン中の事務局担当は失敗カウンタを増やさないので、
+ * 攻撃者の総当たりが続いている間も registerAttendee は通り続ける（ロック中を除く）。
+ */
 function verifyAdminPassword(password) {
+  var cache   = CacheService.getScriptCache();
+  var FAIL_KEY   = 'ADMIN_AUTH_FAILS';
+  var LOCK_KEY   = 'ADMIN_AUTH_LOCKED';
+  var MAX_FAILS  = 5;
+  var FAIL_TTL   = 600;  // 失敗カウンタの保持秒数（10 分）
+  var LOCK_TTL   = 300;  // ロックアウト時間（5 分）
+
+  if (cache.get(LOCK_KEY)) {
+    return false;
+  }
+
   var settings = _getSettings();
-  return String(settings.adminPassword).trim() === String(password).trim();
+  var ok = String(settings.adminPassword).trim() === String(password).trim();
+
+  if (ok) {
+    cache.remove(FAIL_KEY);
+    return true;
+  }
+
+  var fails = Number(cache.get(FAIL_KEY) || '0') + 1;
+  if (fails >= MAX_FAILS) {
+    cache.put(LOCK_KEY, '1', LOCK_TTL);
+    cache.remove(FAIL_KEY);
+  } else {
+    cache.put(FAIL_KEY, String(fails), FAIL_TTL);
+  }
+  return false;
 }
 
 function registerAttendee(email, password) {
@@ -267,12 +299,12 @@ function registerAttendee(email, password) {
 // =============================================================================
 
 function getVoteFormData(token) {
-  var validation = _validateToken(token);
+  var settings = _getSettings();
+  var validation = _validateToken(token, settings);
   if (!validation.valid) {
     return { valid: false, message: validation.message, settings: null };
   }
 
-  var settings = _getSettings();
   return {
     valid:   true,
     message: 'OK',
@@ -289,14 +321,14 @@ function getVoteFormData(token) {
 function submitVote(token, choices) {
   try {
     var settings = _getSettings();
-    
+
     // 設定シートA6の値によって処理を切り替え
     if (settings.mode === '高速モード') {
-      _recordVoteCache(token, choices);
+      _recordVoteCache(token, choices, settings);
     } else {
-      _recordVoteDirect(token, choices);
+      _recordVoteDirect(token, choices, settings);
     }
-    
+
     return { success: true, message: '投票が完了しました。ご参加ありがとうございました。' };
   } catch (err) {
     return { success: false, message: err.message };
@@ -306,9 +338,7 @@ function submitVote(token, choices) {
 /**
  * 【通常モード】スプレッドシートに直接書き込む。小・中規模向け。
  */
-function _recordVoteDirect(token, choices) {
-  var settings = _getSettings();
-
+function _recordVoteDirect(token, choices, settings) {
   for (var v = 0; v < settings.votes.length; v++) {
     if (!choices[v] || choices[v] === '') {
       throw new Error('「' + settings.votes[v].title + '」の選択肢を選んでください。');
@@ -323,7 +353,7 @@ function _recordVoteDirect(token, choices) {
   lock.waitLock(30000);
 
   try {
-    var validation = _validateToken(token);
+    var validation = _validateToken(token, settings);
     if (!validation.valid) throw new Error(validation.message);
 
     var alreadyVoted = rosterSheet.getRange(validation.row, COL_VOTED).getValue();
@@ -344,10 +374,15 @@ function _recordVoteDirect(token, choices) {
 
 /**
  * 【高速モード】CacheServiceに一時保存する。大規模一斉投票向け。
+ *
+ * 【設計メモ：Option C（カウンタ＋個別キー方式）】
+ * 旧実装は MASTER_QUEUE に配列をシリアライズして毎回 read-modify-write していたため、
+ * 件数が増えるとロック内の JSON parse/stringify がスループットの上限を決めていた。
+ * GAS の ScriptLock はグローバルで粒度を下げられないので、ロック内の作業量を
+ * 「カウンタ get → BUFFER_n put → カウンタ put」の O(1) に固定し、
+ * バッチ側 (processVoteBuffer) で 0..n-1 を一括取得する形に変更している。
  */
-function _recordVoteCache(token, choices) {
-  var settings = _getSettings();
-
+function _recordVoteCache(token, choices, settings) {
   for (var v = 0; v < settings.votes.length; v++) {
     if (!choices[v] || choices[v] === '') {
       throw new Error('「' + settings.votes[v].title + '」の選択肢を選んでください。');
@@ -356,50 +391,55 @@ function _recordVoteCache(token, choices) {
 
   var cache = CacheService.getScriptCache();
   var lock = LockService.getScriptLock();
-  lock.waitLock(3000);
-  
+  lock.waitLock(15000);
+
   try {
     var cacheVotedKey = 'VOTED_' + token;
     if (cache.get(cacheVotedKey)) {
       throw new Error('このトークンは既に使用されています。（処理中）');
     }
 
-    var validation = _validateToken(token);
+    var validation = _validateToken(token, settings);
     if (!validation.valid) throw new Error(validation.message);
 
     cache.put(cacheVotedKey, 'true', 21600);
 
-    var bufferKey = 'BUFFER_' + new Date().getTime() + '_' + token.substring(0, 8);
+    // Option C: カウンタを進めて個別キーに書き込むだけ。配列を持ち回さない。
+    var n = Number(cache.get('QUEUE_LEN') || '0');
     var payload = { token: token, choices: choices, date: new Date().toISOString() };
-    cache.put(bufferKey, JSON.stringify(payload), 21600);
-
-    var queueStr = cache.get('MASTER_QUEUE') || '[]';
-    var queue = JSON.parse(queueStr);
-    queue.push(bufferKey);
-    cache.put('MASTER_QUEUE', JSON.stringify(queue), 21600);
+    cache.put('BUFFER_' + n, JSON.stringify(payload), 21600);
+    cache.put('QUEUE_LEN', String(n + 1), 21600);
 
   } finally {
     lock.releaseLock();
   }
 }
 
-function _validateToken(token) {
+/**
+ * トークンの妥当性を検証する。settings は呼び出し側で 1 度だけ取得して渡す前提。
+ * 名簿は (token, url, voted) の 3 列を 1 度のレンジ取得で読み出し、
+ * セル単位の getValue ループを避ける。
+ */
+function _validateToken(token, settings) {
   if (!token) return { valid: false, message: '投票URLが正しくありません。', row: null };
 
-  var settings = _getSettings();
   if (settings.deadline && new Date() > new Date(settings.deadline)) {
     return { valid: false, message: '投票の受付は終了しました。', row: null };
   }
 
   var rosterSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_ROSTER);
   var lastRow     = rosterSheet.getLastRow();
+  if (lastRow < 2) return { valid: false, message: '有効なトークンが見つかりません。', row: null };
 
-  for (var i = 2; i <= lastRow; i++) {
-    var rowToken = rosterSheet.getRange(i, COL_TOKEN).getValue();
-    if (rowToken === token) {
-      var voted = rosterSheet.getRange(i, COL_VOTED).getValue();
-      if (voted === true) return { valid: false, message: 'このURLはすでに使用済みです。', row: i };
-      return { valid: true, message: 'OK', row: i };
+  var numCols = COL_VOTED - COL_TOKEN + 1;
+  var rows    = rosterSheet.getRange(2, COL_TOKEN, lastRow - 1, numCols).getValues();
+  var votedIdx = COL_VOTED - COL_TOKEN;
+
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i][0] === token) {
+      var voted = rows[i][votedIdx];
+      if (voted === true) return { valid: false, message: 'このURLはすでに使用済みです。', row: i + 2 };
+      return { valid: true, message: 'OK', row: i + 2 };
     }
   }
   return { valid: false, message: '有効なトークンが見つかりません。', row: null };
@@ -581,30 +621,37 @@ function _deleteTriggersByName(functionName) {
 function processVoteBuffer() {
   var cache = CacheService.getScriptCache();
   var lock = LockService.getScriptLock();
-  
-  if (!lock.tryLock(10000)) return; 
+
+  // ScriptLock はグローバルなので、このバッチが走っている間は新規 submit は待たされる。
+  // 1 分おきトリガー × 数秒で済む処理量という前提なので、ロックは全工程を通じて保持する。
+  if (!lock.tryLock(10000)) return;
 
   try {
-    var queueStr = cache.get('MASTER_QUEUE');
-    if (!queueStr || queueStr === '[]') return;
-    
-    var queue = JSON.parse(queueStr);
-    cache.put('MASTER_QUEUE', '[]', 21600);
+    var n = Number(cache.get('QUEUE_LEN') || '0');
+    if (n === 0) return;
 
-    var cachedData = cache.getAll(queue);
+    var keys = [];
+    for (var i = 0; i < n; i++) keys.push('BUFFER_' + i);
+
+    var cachedData = cache.getAll(keys) || {};
     var ballotRows = [];
     var votedTokens = [];
 
-    for (var i = 0; i < queue.length; i++) {
-      var key = queue[i];
+    for (var j = 0; j < keys.length; j++) {
+      var key = keys[j];
       if (cachedData[key]) {
         var data = JSON.parse(cachedData[key]);
         var row = [new Date(data.date)].concat(data.choices);
         ballotRows.push(row);
         votedTokens.push(data.token);
-        cache.remove(key); 
       }
     }
+
+    // 取り出し済みなのでカウンタを 0 に戻し、個別キーも掃除する。
+    // ロックを保持したまま行うため、この間に新規 submit が入り込んで
+    // BUFFER_0 を上書きする心配はない。
+    cache.removeAll(keys);
+    cache.put('QUEUE_LEN', '0', 21600);
 
     if (ballotRows.length === 0) return;
 
