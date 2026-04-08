@@ -59,30 +59,55 @@ function initializeSystem() {
   }
 
   // 1. 設定シート
+  // レイアウト:
+  //   A 列 = 項目名（ラベル、編集不要）
+  //   B 列 = 設定値（ユーザーが入力する）
+  //   C 列以降 = 投票項目（C1: 投票1タイトル, C2~: 投票1選択肢, D1~: 投票2 ...）
   var settingsSheet = getOrCreateSheet(SHEET_SETTINGS);
   if (settingsSheet.getLastRow() === 0) {
-    settingsSheet.getRange('A1').setNote('【必須】主催者メールアドレス（結果通知先。複数ある場合はカンマ区切り）');
-    settingsSheet.getRange('A2').setNote('【任意】締め切り日時（例: 2026/04/10 12:00）');
-    settingsSheet.getRange('A3').setNote('【必須】事務局パスワード（当日受付用）');
-    settingsSheet.getRange('A4').setNote('【必須】WebアプリURL（GASをデプロイしたURL）');
-    settingsSheet.getRange('A5').setNote('【必須】フロントエンドのURL（GitHub Pagesなど）');
-    settingsSheet.getRange('A6').setNote('【必須】動作モード（通常モード or 高速モード）');
-    
-    settingsSheet.getRange('A6').setValue('通常モード');
-    
-    settingsSheet.getRange('B1').setValue('投票タイトル（例: 懇親会の場所）');
-    settingsSheet.getRange('B2').setValue('選択肢A');
-    settingsSheet.getRange('B3').setValue('選択肢B');
-    settingsSheet.setColumnWidth(1, 300);
+    // A 列：項目名ラベル（固定）
+    var labels = [
+      ['主催者メールアドレス'],
+      ['締め切り日時'],
+      ['事務局パスワード'],
+      ['WebアプリURL（GAS）'],
+      ['フロントエンドURL（GitHub Pages）'],
+      ['動作モード']
+    ];
+    settingsSheet.getRange('A1:A6').setValues(labels);
+    settingsSheet.getRange('A1:A6')
+      .setFontWeight('bold')
+      .setBackground('#fff2cc')
+      .setHorizontalAlignment('right');
+
+    // 各ラベルにツールチップ（ノート）で詳細説明を付与
+    settingsSheet.getRange('A1').setNote('【必須】結果通知先のメールアドレス。複数の場合はカンマ区切り。2件目以降はBCCで送信されます。');
+    settingsSheet.getRange('A2').setNote('【任意】例: 2026/04/10 12:00。空欄の場合は締切なしで運用できます。');
+    settingsSheet.getRange('A3').setNote('【必須】当日参加者登録 (admin.html) で使用するパスワード。');
+    settingsSheet.getRange('A4').setNote('【必須】GASをデプロイして取得した「ウェブアプリのURL」。設定後に「⑦ デプロイ」ステップで埋めます。');
+    settingsSheet.getRange('A5').setNote('【必須】GitHub Pages 等で公開した投票画面のベースURL（末尾スラッシュなし）。');
+    settingsSheet.getRange('A6').setNote('【必須】「通常モード」または「高速モード」をプルダウンから選択してください。');
+
+    // B 列：値（初期値は B6 だけ「通常モード」を入れておく）
+    settingsSheet.getRange('B6').setValue('通常モード');
+
+    // C 列以降：投票項目のサンプル
+    settingsSheet.getRange('C1').setValue('投票タイトル（例: 懇親会の場所）');
+    settingsSheet.getRange('C2').setValue('選択肢A');
+    settingsSheet.getRange('C3').setValue('選択肢B');
+
+    settingsSheet.setColumnWidth(1, 240); // A 列（ラベル）
+    settingsSheet.setColumnWidth(2, 360); // B 列（値）
+    settingsSheet.setColumnWidth(3, 240); // C 列（投票1）
   }
 
-  // A6セルにプルダウン（データ検証）を設定（初回・再実行どちらでも適用）
+  // B6セルにプルダウン（データ検証）を設定（初回・再実行どちらでも適用）
   var modeRule = SpreadsheetApp.newDataValidation()
     .requireValueInList(['通常モード', '高速モード'], true)
     .setAllowInvalid(false)
     .setHelpText('通常モード（小〜中規模）または 高速モード（大規模一斉投票）を選択してください。')
     .build();
-  settingsSheet.getRange('A6').setDataValidation(modeRule);
+  settingsSheet.getRange('B6').setDataValidation(modeRule);
 
   // 2. 名簿とトークンシート
   var rosterSheet = getOrCreateSheet(SHEET_ROSTER);
@@ -112,7 +137,7 @@ function initializeSystem() {
   var defaultSheet = ss.getSheetByName('シート1');
   if (defaultSheet && ss.getSheets().length > 1) ss.deleteSheet(defaultSheet);
 
-  ui.alert('Votelyのデータベース構築が完了しました！\n\nA6セルで「通常モード」と「高速モード」を切り替えられます。');
+  ui.alert('Votelyのデータベース構築が完了しました！\n\n設定シートのB列に値を入力してください。\nB6セルで「通常モード」と「高速モード」を切り替えられます。');
 }
 
 // =============================================================================
@@ -324,7 +349,7 @@ function submitVote(token, choices) {
   try {
     var settings = _getSettings();
 
-    // 設定シートA6の値によって処理を切り替え
+    // 設定シートB6の値によって処理を切り替え
     if (settings.mode === '高速モード') {
       _recordVoteCache(token, choices, settings);
     } else {
@@ -552,7 +577,7 @@ function tallySendResults() {
 function setupTrigger() {
   var settings = _getSettings();
   if (!settings.deadline) {
-    SpreadsheetApp.getUi().alert('設定シートのA2に締め切り日時が設定されていません。');
+    SpreadsheetApp.getUi().alert('設定シートのB2に締め切り日時が設定されていません。');
     return;
   }
 
@@ -731,7 +756,7 @@ function createGuestTickets(params) {
   var settings = _getSettings();
   var pagesUrl = settings.pagesUrl || settings.appUrl;
   if (!pagesUrl) {
-    throw new Error('設定シートの A5（または A4）に投票画面URLを設定してください。');
+    throw new Error('設定シートの B5（または B4）に投票画面URLを設定してください。');
   }
 
   if (settings.deadline && new Date() > new Date(settings.deadline)) {
@@ -908,17 +933,21 @@ function _buildGuestTicketsDialogHtml() {
 // =============================================================================
 
 function _getSettings() {
+  // 設定シートのレイアウト:
+  //   A 列 = 項目名（ラベル、読み飛ばす）
+  //   B 列 = 設定値（B1〜B6 をそれぞれ読む）
+  //   C 列以降 = 投票項目（行1: タイトル、行2以降: 選択肢）
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_SETTINGS);
-  var organizerEmails = _parseEmails(sheet.getRange('A1').getValue());
-  var deadline        = sheet.getRange('A2').getValue();
-  var adminPassword   = sheet.getRange('A3').getValue();
-  var appUrl          = _normalizeAppUrl(String(sheet.getRange('A4').getValue()).trim());
-  var pagesUrl        = String(sheet.getRange('A5').getValue()).trim();
-  var mode            = String(sheet.getRange('A6').getValue()).trim() || '通常モード';
+  var organizerEmails = _parseEmails(sheet.getRange('B1').getValue());
+  var deadline        = sheet.getRange('B2').getValue();
+  var adminPassword   = sheet.getRange('B3').getValue();
+  var appUrl          = _normalizeAppUrl(String(sheet.getRange('B4').getValue()).trim());
+  var pagesUrl        = String(sheet.getRange('B5').getValue()).trim();
+  var mode            = String(sheet.getRange('B6').getValue()).trim() || '通常モード';
 
   var maxRow = sheet.getLastRow();
   var votes   = [];
-  var col     = 2;
+  var col     = 3; // C 列以降が投票項目
 
   while (true) {
     var title = sheet.getRange(1, col).getValue();

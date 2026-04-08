@@ -41,19 +41,19 @@ function runSpikeTest() {
   var rosterSheet = ss.getSheetByName('名簿とトークン');
   var settingsSheet = ss.getSheetByName('設定');
 
-  // WebアプリのURLを取得（GASに直接POSTするので A4 = GAS URL を使う）
-  var appUrl = String(settingsSheet.getRange('A4').getValue()).trim();
+  // WebアプリのURLを取得（GASに直接POSTするので B4 = GAS URL を使う）
+  var appUrl = String(settingsSheet.getRange('B4').getValue()).trim();
   if (!appUrl || !appUrl.startsWith('https://script.google.com/')) {
-    SpreadsheetApp.getUi().alert('エラー: 設定シートのA4に正しいWebアプリURLを入力してください。');
+    SpreadsheetApp.getUi().alert('エラー: 設定シートのB4に正しいWebアプリURLを入力してください。');
     return;
   }
 
   // 投票数ぶんの選択肢を組み立てる
-  // - 行1の B 列以降にタイトルがある列を「投票」として認識
+  // - 行1の C 列以降にタイトルがある列を「投票」として認識
   // - 各列の行2を「その投票の先頭の選択肢」として採用
   var validChoicesArray = _collectFirstChoicesPerVote(settingsSheet);
   if (validChoicesArray.length === 0) {
-    SpreadsheetApp.getUi().alert('エラー: 設定シートに投票項目（B1セル以降のタイトル）が見つかりません。');
+    SpreadsheetApp.getUi().alert('エラー: 設定シートに投票項目（C1セル以降のタイトル）が見つかりません。');
     return;
   }
 
@@ -74,7 +74,13 @@ function runSpikeTest() {
     return;
   }
 
-  Logger.log('【スパイクテスト開始】 ' + tokens.length + ' 件の同時リクエストを送信します...');
+  // 1バッチあたりのリクエスト数。
+  // GAS の urlfetch は短時間大量呼び出しで "Service invoked too many times" が出るため、
+  // BATCH_SIZE 件ずつ fetchAll → 1秒 sleep を繰り返してレート制限を回避する。
+  // 値を大きくすれば速くなるが制限に引っかかりやすくなる（50 が安全な目安）。
+  var BATCH_SIZE = 50;
+
+  Logger.log('【スパイクテスト開始】 ' + tokens.length + ' 件を ' + BATCH_SIZE + ' 件/バッチで送信します...');
   Logger.log('投票数: ' + validChoicesArray.length + '（各投票で送る選択肢: ' + JSON.stringify(validChoicesArray) + '）');
 
   // リクエストの配列を構築
@@ -96,11 +102,11 @@ function runSpikeTest() {
     });
   }
 
-  // 💥 一斉送信ラウンド1（完全並列）
+  // 💥 バッチ並列送信（BATCH_SIZE 件ずつ fetchAll、バッチ間は 1 秒 sleep）
   var startTime = new Date().getTime();
-  var responses = UrlFetchApp.fetchAll(requests);
+  var responses = _fetchAllBatched(requests, BATCH_SIZE);
 
-  // ラウンド2: 5xx / 429 のものだけ集めてもう一度並列で投げる
+  // ラウンド2: 5xx / 429 のものだけ集めてもう一度バッチ並列で投げる
   var MAX_RETRY_ROUNDS = 2;
   for (var round = 1; round <= MAX_RETRY_ROUNDS; round++) {
     var retryRequests = [];
@@ -116,7 +122,7 @@ function runSpikeTest() {
 
     Logger.log('リトライ ラウンド ' + round + ': ' + retryRequests.length + ' 件を再送信');
     Utilities.sleep(1000 * round); // 1秒, 2秒... の線形バックオフ
-    var retryResponses = UrlFetchApp.fetchAll(retryRequests);
+    var retryResponses = _fetchAllBatched(retryRequests, BATCH_SIZE);
     for (var r = 0; r < retryResponses.length; r++) {
       responses[retryIndices[r]] = retryResponses[r];
     }
@@ -168,18 +174,47 @@ function runSpikeTest() {
 }
 
 /**
+ * リクエスト配列を batchSize 件ずつに分割して fetchAll し、全レスポンスを結合して返す。
+ * バッチ間は 1 秒 sleep することで GAS の urlfetch レート制限（短時間大量呼び出し禁止）を回避する。
+ *
+ * @param {Object[]} allRequests - UrlFetchApp.fetchAll に渡せる形式のリクエスト配列
+ * @param {number}   batchSize   - 1 バッチあたりの最大リクエスト数（推奨: 50）
+ * @returns {HTTPResponse[]} allRequests と同じ順序・長さのレスポンス配列
+ */
+function _fetchAllBatched(allRequests, batchSize) {
+  var allResponses = [];
+  for (var start = 0; start < allRequests.length; start += batchSize) {
+    var batch = allRequests.slice(start, start + batchSize);
+    var batchNum = Math.floor(start / batchSize) + 1;
+    var totalBatches = Math.ceil(allRequests.length / batchSize);
+    Logger.log('バッチ ' + batchNum + '/' + totalBatches + ': ' + batch.length + ' 件を送信中...');
+    var batchResponses = UrlFetchApp.fetchAll(batch);
+    for (var i = 0; i < batchResponses.length; i++) {
+      allResponses.push(batchResponses[i]);
+    }
+    // 最後のバッチ以外は sleep でレート制限を回避
+    if (start + batchSize < allRequests.length) {
+      Utilities.sleep(1000);
+    }
+  }
+  return allResponses;
+}
+
+/**
  * 設定シートから「各投票の先頭の選択肢」を 1 度の getValues 呼び出しで集める。
  * 構造前提:
- *   行1: B1, C1, D1, ... に投票タイトル
- *   行2: B2, C2, D2, ... に各投票の最初の選択肢
+ *   A 列 = 項目名ラベル、B 列 = 設定値、C 列以降 = 投票項目
+ *   行1: C1, D1, E1, ... に投票タイトル
+ *   行2: C2, D2, E2, ... に各投票の最初の選択肢
  * タイトルが空の列は投票として扱わない。
  */
 function _collectFirstChoicesPerVote(settingsSheet) {
   var lastCol = settingsSheet.getLastColumn();
-  if (lastCol < 2) return [];
+  if (lastCol < 3) return [];
 
-  var headerRow = settingsSheet.getRange(1, 2, 1, lastCol - 1).getValues()[0];
-  var firstOptionRow = settingsSheet.getRange(2, 2, 1, lastCol - 1).getValues()[0];
+  // C 列（列番号3）以降を読む
+  var headerRow      = settingsSheet.getRange(1, 3, 1, lastCol - 2).getValues()[0];
+  var firstOptionRow = settingsSheet.getRange(2, 3, 1, lastCol - 2).getValues()[0];
 
   var choices = [];
   for (var i = 0; i < headerRow.length; i++) {
