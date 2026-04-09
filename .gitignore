@@ -1,2 +1,17 @@
 # clasp 認証情報（スクリプトIDを含むため公開しない）
 .clasp.json
+
+# votely_tool.py — 認証・設定ファイル（絶対にコミットしない）
+votely_config.json
+.votely_oauth_token.pkl
+service_account.json
+*_credentials.json
+*_service_account.json
+
+# Python キャッシュ
+__pycache__/
+*.pyc
+*.pyo
+
+# 生成物（PDF はローカルのみ）
+guest_tickets_*.pdf
