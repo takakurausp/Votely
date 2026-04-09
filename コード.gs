@@ -40,6 +40,9 @@ function onOpen() {
     .addSeparator()
     .addItem('⑧ 📥 メールアドレスを CSV エクスポート', 'exportRosterCsv')
     .addItem('⑨ 📤 トークン CSV をインポート',          'showImportTokenCsvDialog')
+    .addSeparator()
+    .addItem('🔧 キャッシュを今すぐ書き込む（高速モード・手動フラッシュ）', 'processVoteBufferManual')
+    .addItem('🔍 キャッシュ状態を確認する（デバッグ用）',                   'diagnoseCacheState')
     .addToUi();
 }
 
@@ -421,7 +424,13 @@ function _recordVoteCache(token, choices, settings) {
 
   var cache = CacheService.getScriptCache();
   var lock = LockService.getScriptLock();
-  lock.waitLock(15000);
+
+  // 高負荷時にロック待機で弾かれないよう 30 秒に延長。
+  // ロック内の作業は O(1)（カウンタ get + put × 2）なので
+  // 実際の保持時間は数十 ms に収まり、他リクエストへの影響は最小限。
+  if (!lock.tryLock(30000)) {
+    throw new Error('サーバーが混雑しています（ロックタイムアウト）。しばらくしてから再送してください。');
+  }
 
   try {
     var cacheVotedKey = 'VOTED_' + token;
@@ -1283,4 +1292,90 @@ function _parseCsv(text) {
     rows.push(cols);
   }
   return rows;
+}
+
+// =============================================================================
+// デバッグ・運用補助ユーティリティ
+// =============================================================================
+
+/**
+ * 高速モード用: キャッシュに溜まった投票データを今すぐシートに書き込む。
+ * スパイクテスト後に FALSE が残っている場合や、トリガーを待てない場合に手動実行する。
+ */
+function processVoteBufferManual() {
+  var ui = SpreadsheetApp.getUi();
+  var cache = CacheService.getScriptCache();
+  var n = Number(cache.get('QUEUE_LEN') || '0');
+  if (n === 0) {
+    ui.alert('キャッシュは空です。書き込む投票データがありません。\n（すでにフラッシュ済みか、通常モードで運用中の可能性があります）');
+    return;
+  }
+  var ans = ui.alert(
+    '手動フラッシュの確認',
+    'キャッシュに ' + n + ' 件の投票データがあります。今すぐシートに書き込みますか？',
+    ui.ButtonSet.YES_NO
+  );
+  if (ans !== ui.Button.YES) return;
+
+  processVoteBuffer();
+  ui.alert('完了しました。「投票箱」シートを確認してください。');
+}
+
+/**
+ * デバッグ用: CacheService の状態をログに出力する。
+ * スパイクテスト後に「何件キャッシュに残っているか」を確認するために使う。
+ *
+ * 確認手順:
+ *   1. スプレッドシートのメニューから「🔍 キャッシュ状態を確認する」を実行
+ *   2. Apps Script エディタ → 「実行数」タブ → この関数のログを開く
+ */
+function diagnoseCacheState() {
+  var cache = CacheService.getScriptCache();
+  var n     = Number(cache.get('QUEUE_LEN') || '0');
+
+  Logger.log('==============================');
+  Logger.log('キャッシュ診断レポート');
+  Logger.log('  QUEUE_LEN  : ' + n + ' 件');
+
+  if (n === 0) {
+    Logger.log('  → キャッシュは空です（フラッシュ済みか通常モード）');
+  } else {
+    // 先頭 5 件の内容をサンプル表示
+    var sampleKeys = [];
+    for (var i = 0; i < Math.min(n, 5); i++) sampleKeys.push('BUFFER_' + i);
+    var samples = cache.getAll(sampleKeys);
+    Logger.log('  先頭 ' + sampleKeys.length + ' 件のサンプル:');
+    for (var k in samples) {
+      try {
+        var obj = JSON.parse(samples[k]);
+        Logger.log('    ' + k + ': token=' + String(obj.token).substring(0, 8) + '... choices=' + JSON.stringify(obj.choices));
+      } catch (e) {
+        Logger.log('    ' + k + ': ' + samples[k]);
+      }
+    }
+  }
+
+  // 名簿の投票済みカウントも合わせて確認
+  var ss          = SpreadsheetApp.getActiveSpreadsheet();
+  var rosterSheet = ss.getSheetByName(SHEET_ROSTER);
+  var lastRow     = rosterSheet.getLastRow();
+  var votedCount  = 0;
+  var totalCount  = 0;
+  if (lastRow >= 2) {
+    var flags = rosterSheet.getRange(2, COL_VOTED, lastRow - 1, 1).getValues();
+    for (var f = 0; f < flags.length; f++) {
+      if (String(flags[f][0]).trim()) totalCount++;
+      if (flags[f][0] === true) votedCount++;
+    }
+  }
+  Logger.log('  名簿: 全 ' + totalCount + ' 行 / 投票済み(TRUE): ' + votedCount + ' 行 / 未投票(FALSE): ' + (totalCount - votedCount) + ' 行');
+  Logger.log('==============================');
+
+  SpreadsheetApp.getUi().alert(
+    'キャッシュ診断結果\n\n' +
+    'キャッシュ内未書込み件数: ' + n + ' 件\n' +
+    '名簿の投票済み(TRUE): ' + votedCount + ' 行\n' +
+    '名簿の未投票(FALSE): ' + (totalCount - votedCount) + ' 行\n\n' +
+    '詳細は Apps Script エディタの「実行数」タブでログを確認してください。'
+  );
 }

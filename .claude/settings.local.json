@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(python votely_tool.py --help)",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(node -e \"require\\(''fs''\\).readFileSync\\(''testtool.js'',''utf8''\\); console.log\\(''testtool.js: OK''\\)\")",
+      "Bash(node -e \"require\\(''fs''\\).readFileSync\\(''コード.gs'',''utf8''\\); console.log\\(''コード.gs: OK''\\)\")"
     ]
   }
 }

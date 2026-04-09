@@ -74,14 +74,25 @@ function runSpikeTest() {
     return;
   }
 
+  // ── 時間制限 ───────────────────────────────────────────────────────────────
+  // GAS の実行時間上限は 6 分（360 秒）。
+  // fetchAll の応答待ち（ロックタイムアウト最大 30 秒 × バッチ数）が積み重なると
+  // 容易に超過するため、残り 60 秒を切ったら送信を打ち切って集計に移行する。
+  var EXEC_LIMIT_MS   = 5 * 60 * 1000;   // 5 分で打ち切り（1 分のバッファ）
+  var startTime       = new Date().getTime();
+
+  function _timeRemaining() {
+    return EXEC_LIMIT_MS - (new Date().getTime() - startTime);
+  }
+
   // 1バッチあたりのリクエスト数。
   // GAS の urlfetch は短時間大量呼び出しで "Service invoked too many times" が出るため、
   // BATCH_SIZE 件ずつ fetchAll → 1秒 sleep を繰り返してレート制限を回避する。
-  // 値を大きくすれば速くなるが制限に引っかかりやすくなる（50 が安全な目安）。
   var BATCH_SIZE = 50;
 
   Logger.log('【スパイクテスト開始】 ' + tokens.length + ' 件を ' + BATCH_SIZE + ' 件/バッチで送信します...');
   Logger.log('投票数: ' + validChoicesArray.length + '（各投票で送る選択肢: ' + JSON.stringify(validChoicesArray) + '）');
+  Logger.log('実行時間上限: ' + (EXEC_LIMIT_MS / 1000) + ' 秒（超過時は途中集計して終了）');
 
   // リクエストの配列を構築
   var requests = [];
@@ -103,12 +114,16 @@ function runSpikeTest() {
   }
 
   // 💥 バッチ並列送信（BATCH_SIZE 件ずつ fetchAll、バッチ間は 1 秒 sleep）
-  var startTime = new Date().getTime();
-  var responses = _fetchAllBatched(requests, BATCH_SIZE);
+  var responses = _fetchAllBatched(requests, BATCH_SIZE, _timeRemaining);
 
   // ラウンド2: 5xx / 429 のものだけ集めてもう一度バッチ並列で投げる
+  // 時間が残っている場合のみ実施する
   var MAX_RETRY_ROUNDS = 2;
   for (var round = 1; round <= MAX_RETRY_ROUNDS; round++) {
+    if (_timeRemaining() < 30000) {
+      Logger.log('⏱ 残り時間が少ないためリトライをスキップします（残 ' + Math.round(_timeRemaining()/1000) + ' 秒）');
+      break;
+    }
     var retryRequests = [];
     var retryIndices = [];
     for (var k = 0; k < responses.length; k++) {
@@ -121,8 +136,8 @@ function runSpikeTest() {
     if (retryRequests.length === 0) break;
 
     Logger.log('リトライ ラウンド ' + round + ': ' + retryRequests.length + ' 件を再送信');
-    Utilities.sleep(1000 * round); // 1秒, 2秒... の線形バックオフ
-    var retryResponses = _fetchAllBatched(retryRequests, BATCH_SIZE);
+    Utilities.sleep(1000 * round);
+    var retryResponses = _fetchAllBatched(retryRequests, BATCH_SIZE, _timeRemaining);
     for (var r = 0; r < retryResponses.length; r++) {
       responses[retryIndices[r]] = retryResponses[r];
     }
@@ -177,21 +192,43 @@ function runSpikeTest() {
  * リクエスト配列を batchSize 件ずつに分割して fetchAll し、全レスポンスを結合して返す。
  * バッチ間は 1 秒 sleep することで GAS の urlfetch レート制限（短時間大量呼び出し禁止）を回避する。
  *
- * @param {Object[]} allRequests - UrlFetchApp.fetchAll に渡せる形式のリクエスト配列
- * @param {number}   batchSize   - 1 バッチあたりの最大リクエスト数（推奨: 50）
+ * @param {Object[]} allRequests    - UrlFetchApp.fetchAll に渡せる形式のリクエスト配列
+ * @param {number}   batchSize      - 1 バッチあたりの最大リクエスト数（推奨: 50）
+ * @param {Function} [timeRemaining] - 残り時間(ms)を返す関数。30秒以下になったら打ち切る
  * @returns {HTTPResponse[]} allRequests と同じ順序・長さのレスポンス配列
+ *          時間切れで打ち切った分は {getResponseCode:()=>0, getContentText:()=>'{}'} の
+ *          ダミーオブジェクトで埋める。
  */
-function _fetchAllBatched(allRequests, batchSize) {
+function _fetchAllBatched(allRequests, batchSize, timeRemaining) {
   var allResponses = [];
+
+  // 未送信分をダミーレスポンスで初期化しておく（打ち切り時に長さを合わせるため）
+  var _dummy = {
+    getResponseCode: function() { return 0; },
+    getContentText:  function() { return '{}'; }
+  };
+  for (var init = 0; init < allRequests.length; init++) {
+    allResponses.push(_dummy);
+  }
+
   for (var start = 0; start < allRequests.length; start += batchSize) {
+    // 時間切れチェック：30 秒以下になったら送信を打ち切る
+    if (typeof timeRemaining === 'function' && timeRemaining() < 30000) {
+      var remaining = allRequests.length - start;
+      Logger.log('⏱ 時間切れのため残り ' + remaining + ' 件の送信をスキップします。');
+      break;
+    }
+
     var batch = allRequests.slice(start, start + batchSize);
     var batchNum = Math.floor(start / batchSize) + 1;
     var totalBatches = Math.ceil(allRequests.length / batchSize);
     Logger.log('バッチ ' + batchNum + '/' + totalBatches + ': ' + batch.length + ' 件を送信中...');
+
     var batchResponses = UrlFetchApp.fetchAll(batch);
     for (var i = 0; i < batchResponses.length; i++) {
-      allResponses.push(batchResponses[i]);
+      allResponses[start + i] = batchResponses[i];
     }
+
     // 最後のバッチ以外は sleep でレート制限を回避
     if (start + batchSize < allRequests.length) {
       Utilities.sleep(1000);
