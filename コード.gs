@@ -37,6 +37,9 @@ function onOpen() {
     .addItem('⑥ 締め切りトリガーをセットアップ', 'setupTrigger')
     .addSeparator()
     .addItem('⑦ 🎫 当日参加者用チケット一括発行（PDF印刷）', 'generateGuestTickets')
+    .addSeparator()
+    .addItem('⑧ 📥 メールアドレスを CSV エクスポート', 'exportRosterCsv')
+    .addItem('⑨ 📤 トークン CSV をインポート',          'showImportTokenCsvDialog')
     .addToUi();
 }
 
@@ -1024,4 +1027,260 @@ function _parseEmails(raw) {
   return String(raw).split(',')
     .map(function(addr) { return addr.replace(/[\s\u3000]+/g, ''); })
     .filter(function(addr) { return addr.length > 0; });
+}
+
+// =============================================================================
+// 機能H: メールアドレス CSV エクスポート（Python 連携用）
+// =============================================================================
+
+/**
+ * 名簿シートのメールアドレス（トークン未発行行）を CSV でダウンロードさせる。
+ * Python ツールで一括トークン発行 → ⑨ でインポートする想定。
+ */
+function exportRosterCsv() {
+  var ss    = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(SHEET_ROSTER);
+  var last  = sheet.getLastRow();
+  if (last < 2) {
+    SpreadsheetApp.getUi().alert('名簿にデータがありません。');
+    return;
+  }
+
+  var data   = sheet.getRange(2, COL_EMAIL, last - 1, 2).getValues();
+  var emails = [];
+  var skip   = 0;
+  for (var i = 0; i < data.length; i++) {
+    var email = String(data[i][0]).trim();
+    var token = String(data[i][1]).trim();
+    if (!email) continue;
+    if (token) { skip++; continue; }   // 発行済みはスキップ
+    emails.push(email);
+  }
+
+  if (emails.length === 0) {
+    SpreadsheetApp.getUi().alert(
+      'トークン未発行のメールアドレスがありません。\n' +
+      '（発行済み: ' + skip + ' 件）'
+    );
+    return;
+  }
+
+  // CSV テキスト（BOM 付き UTF-8 → Excel で文字化けしない）
+  var lines = ['\uFEFFメールアドレス'];
+  for (var j = 0; j < emails.length; j++) lines.push(emails[j]);
+  var csvText = lines.join('\n');
+
+  var html = HtmlService.createHtmlOutput(
+    _buildExportHtml(csvText, emails.length, skip)
+  ).setWidth(500).setHeight(320);
+  SpreadsheetApp.getUi().showModalDialog(html, '📥 メールアドレス CSV エクスポート');
+}
+
+function _buildExportHtml(csvText, unissued, issued) {
+  var encoded = JSON.stringify(csvText);   // JS 文字列として安全にエンコード
+  return '<html><head><meta charset="UTF-8">'
+    + '<style>'
+    + 'body{font-family:"Yu Gothic UI",sans-serif;margin:16px;font-size:13px;color:#1e293b}'
+    + 'p{margin:0 0 10px}'
+    + '.stat{background:#f1f5f9;border-radius:6px;padding:10px 14px;margin-bottom:14px;font-size:12px}'
+    + '.btn{display:inline-block;background:#3b82f6;color:#fff;border:none;'
+    + '     padding:9px 24px;border-radius:6px;cursor:pointer;font-size:13px;'
+    + '     font-family:inherit}'
+    + '.btn:hover{background:#2563eb}'
+    + '.note{font-size:11px;color:#64748b;margin-top:10px}'
+    + '</style></head><body>'
+    + '<div class="stat">'
+    + '未発行: <b>' + unissued + ' 件</b>　／　発行済み（スキップ）: ' + issued + ' 件'
+    + '</div>'
+    + '<p>以下のボタンで CSV をダウンロードし、<br>'
+    + 'Python ツールでトークンを生成してください。</p>'
+    + '<button class="btn" onclick="dl()">📥 CSV をダウンロード</button>'
+    + '<p class="note">ダウンロード後、votely_gui.py の①タブで読み込んでください。</p>'
+    + '<script>'
+    + 'var d=' + encoded + ';'
+    + 'function dl(){'
+    + '  var a=document.createElement("a");'
+    + '  a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(d);'
+    + '  a.download="roster_emails.csv";'
+    + '  document.body.appendChild(a);a.click();document.body.removeChild(a);'
+    + '}'
+    + '</script></body></html>';
+}
+
+// =============================================================================
+// 機能I: トークン CSV インポート（Python 連携用）
+// =============================================================================
+
+/**
+ * Python ツールが出力したトークン CSV を読み込み、名簿シートに反映する。
+ * CSV 形式: メールアドレス, トークン, 投票用URL, 投票済みフラグ
+ * - 一致するメールアドレスがあればトークン/URL/フラグを上書き
+ * - なければ新規行として追加
+ */
+function showImportTokenCsvDialog() {
+  var html = HtmlService.createHtmlOutput(_buildImportHtml())
+    .setWidth(560).setHeight(440);
+  SpreadsheetApp.getUi().showModalDialog(html, '📤 トークン CSV インポート');
+}
+
+/** インポートの実処理（モーダルの JS から google.script.run で呼ばれる） */
+function importTokenCsv(csvText) {
+  var rows = _parseCsv(csvText);
+  if (rows.length === 0) throw new Error('CSV にデータがありません。');
+
+  // ヘッダ行を判定してスキップ
+  var start = 0;
+  if (rows[0].length > 0) {
+    var h = String(rows[0][0]).toLowerCase().replace(/\s/g, '');
+    if (h === 'メールアドレス' || h === 'email' || h === 'ゲストラベル') start = 1;
+  }
+
+  var ss          = SpreadsheetApp.getActiveSpreadsheet();
+  var rosterSheet = ss.getSheetByName(SHEET_ROSTER);
+  var last        = rosterSheet.getLastRow();
+
+  // 既存メールアドレス → 行番号マップを構築
+  var emailToRow = {};
+  if (last >= 2) {
+    var existing = rosterSheet.getRange(2, COL_EMAIL, last - 1, 1).getValues();
+    for (var i = 0; i < existing.length; i++) {
+      var e = String(existing[i][0]).trim().toLowerCase();
+      if (e) emailToRow[e] = i + 2;  // 1-indexed
+    }
+  }
+
+  var updated = 0;
+  var added   = 0;
+  var newRows = [];
+
+  for (var r = start; r < rows.length; r++) {
+    var row   = rows[r];
+    var email = String(row[0] || '').trim();
+    var token = String(row[1] || '').trim();
+    var url   = String(row[2] || '').trim();
+    var voted = String(row[3] || 'FALSE').trim().toUpperCase() === 'TRUE';
+    if (!email || !token) continue;
+
+    var existRow = emailToRow[email.toLowerCase()];
+    if (existRow) {
+      // 既存行を更新
+      rosterSheet.getRange(existRow, COL_TOKEN, 1, 3).setValues([[token, url, voted]]);
+      updated++;
+    } else {
+      // 新規行として追記
+      newRows.push([email, token, url, voted]);
+      emailToRow[email.toLowerCase()] = last + newRows.length + 1;
+      added++;
+    }
+  }
+
+  if (newRows.length > 0) {
+    rosterSheet.getRange(last + 1, 1, newRows.length, 4).setValues(newRows);
+  }
+  SpreadsheetApp.flush();
+
+  return { updated: updated, added: added };
+}
+
+function _buildImportHtml() {
+  return '<html><head><meta charset="UTF-8">'
+    + '<style>'
+    + 'body{font-family:"Yu Gothic UI",sans-serif;margin:16px;font-size:13px;color:#1e293b}'
+    + 'input[type=file]{margin:8px 0;font-size:12px}'
+    + '.preview{width:100%;border-collapse:collapse;margin:8px 0;font-size:11px;'
+    + '         max-height:160px;overflow-y:auto;display:block}'
+    + '.preview th{background:#e2e8f0;padding:4px 8px;text-align:left}'
+    + '.preview td{padding:3px 8px;border-bottom:1px solid #f1f5f9}'
+    + '.btn{background:#3b82f6;color:#fff;border:none;padding:9px 24px;'
+    + '     border-radius:6px;cursor:pointer;font-size:13px;font-family:inherit}'
+    + '.btn:hover{background:#2563eb}'
+    + '.btn:disabled{background:#94a3b8;cursor:default}'
+    + '#status{margin-top:10px;font-size:12px;color:#16a34a;min-height:18px}'
+    + '#err{color:#dc2626;font-size:12px;min-height:18px}'
+    + '</style></head><body>'
+    + '<p>Python ツール（votely_gui.py）が出力した CSV を選択してください。</p>'
+    + '<input type="file" id="f" accept=".csv" onchange="load(this)">'
+    + '<div id="previewWrap"></div>'
+    + '<br>'
+    + '<button class="btn" id="btn" onclick="doImport()" disabled>📤 インポート実行</button>'
+    + '<div id="status"></div><div id="err"></div>'
+    + '<script>'
+    + 'var csvText="";'
+    + 'function load(inp){'
+    + '  var file=inp.files[0]; if(!file)return;'
+    + '  var r=new FileReader();'
+    + '  r.onload=function(e){'
+    + '    csvText=e.target.result.replace(/^\\uFEFF/,"");'  // BOM除去
+    + '    showPreview(csvText);'
+    + '    document.getElementById("btn").disabled=false;'
+    + '  };'
+    + '  r.readAsText(file,"UTF-8");'
+    + '}'
+    + 'function showPreview(text){'
+    + '  var lines=text.trim().split(/\\r?\\n/);'
+    + '  var html=\'<table class="preview"><thead><tr>\';'
+    + '  var heads=lines[0].split(",");'
+    + '  heads.forEach(function(h){html+=\'<th>\'+esc(h)+\'</th>\';});'
+    + '  html+=\'</tr></thead><tbody>\';'
+    + '  var limit=Math.min(lines.length,6);'
+    + '  for(var i=1;i<limit;i++){'
+    + '    var cols=lines[i].split(",");'
+    + '    html+=\'<tr>\';'
+    + '    cols.forEach(function(c){html+=\'<td>\'+esc(c)+\'</td>\';});'
+    + '    html+=\'</tr>\';'
+    + '  }'
+    + '  if(lines.length>6)html+=\'<tr><td colspan="\'+heads.length+\'">'
+    +    '… 他 \'+(lines.length-6)+\' 行</td></tr>\';'
+    + '  html+=\'</tbody></table>\';'
+    + '  document.getElementById("previewWrap").innerHTML=html;'
+    + '}'
+    + 'function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;");}'
+    + 'function doImport(){'
+    + '  var btn=document.getElementById("btn");'
+    + '  btn.disabled=true; btn.textContent="処理中...";'
+    + '  document.getElementById("err").textContent="";'
+    + '  google.script.run'
+    + '    .withSuccessHandler(function(res){'
+    + '      document.getElementById("status").textContent='
+    + '        "✅ 完了: 更新 "+res.updated+" 件 / 追加 "+res.added+" 件";'
+    + '      btn.textContent="完了";'
+    + '    })'
+    + '    .withFailureHandler(function(e){'
+    + '      document.getElementById("err").textContent="エラー: "+(e.message||e);'
+    + '      btn.disabled=false; btn.textContent="📤 インポート実行";'
+    + '    })'
+    + '    .importTokenCsv(csvText);'
+    + '}'
+    + '</script></body></html>';
+}
+
+/**
+ * CSV テキストを 2 次元配列にパースする。
+ * BOM・クォート・CRLF を処理する。
+ */
+function _parseCsv(text) {
+  text = text.replace(/^\uFEFF/, '');      // BOM 除去
+  var rows = [];
+  var lines = text.split(/\r?\n/);
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    if (!line.trim()) continue;
+    var cols = [];
+    var cur  = '';
+    var inQ  = false;
+    for (var c = 0; c < line.length; c++) {
+      var ch = line[c];
+      if (ch === '"') {
+        if (inQ && line[c + 1] === '"') { cur += '"'; c++; }
+        else inQ = !inQ;
+      } else if (ch === ',' && !inQ) {
+        cols.push(cur); cur = '';
+      } else {
+        cur += ch;
+      }
+    }
+    cols.push(cur);
+    rows.push(cols);
+  }
+  return rows;
 }

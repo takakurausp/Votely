@@ -1,14 +1,10 @@
-# Votely 管理ツール (votely_tool.py) の依存ライブラリ
+# Votely 管理ツール (votely_gui.py / votely_tool.py) の依存ライブラリ
 #
 # インストール:
 #   pip install -r requirements.txt
 #
-# Python 3.9 以上を推奨
+# ※ Google API 連携なし。完全ローカル動作。
 
-gspread>=6.0.0
-google-auth>=2.0.0
-google-auth-oauthlib>=1.0.0
-google-auth-httplib2>=0.2.0
 qrcode[pil]>=7.4
 reportlab>=4.0.0
 Pillow>=10.0.0
