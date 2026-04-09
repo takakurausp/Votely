@@ -412,8 +412,13 @@ function _recordVoteDirect(token, choices, settings) {
  * 旧実装は MASTER_QUEUE に配列をシリアライズして毎回 read-modify-write していたため、
  * 件数が増えるとロック内の JSON parse/stringify がスループットの上限を決めていた。
  * GAS の ScriptLock はグローバルで粒度を下げられないので、ロック内の作業量を
- * 「カウンタ get → BUFFER_n put → カウンタ put」の O(1) に固定し、
- * バッチ側 (processVoteBuffer) で 0..n-1 を一括取得する形に変更している。
+ * ScriptLock を一切使わないロックフリー設計。
+ * 共有カウンタ（QUEUE_LEN）を廃止し、トークン自体をキーとして
+ * 「VOTE_{token}」に直接格納する。トークンはユーザーごとにユニークなので
+ * キーの衝突がなく、ロックなしで並列書き込みしても安全。
+ *
+ * processVoteBuffer 側は名簿の未投票行をスキャンして
+ * VOTE_{token} の存在を確認する方式に変更している。
  */
 function _recordVoteCache(token, choices, settings) {
   for (var v = 0; v < settings.votes.length; v++) {
@@ -423,35 +428,23 @@ function _recordVoteCache(token, choices, settings) {
   }
 
   var cache = CacheService.getScriptCache();
-  var lock = LockService.getScriptLock();
 
-  // 高負荷時にロック待機で弾かれないよう 30 秒に延長。
-  // ロック内の作業は O(1)（カウンタ get + put × 2）なので
-  // 実際の保持時間は数十 ms に収まり、他リクエストへの影響は最小限。
-  if (!lock.tryLock(30000)) {
-    throw new Error('サーバーが混雑しています（ロックタイムアウト）。しばらくしてから再送してください。');
+  // キャッシュで二重投票チェック（シート書き込み前でも防止できる）
+  var cacheVotedKey = 'VOTED_' + token;
+  if (cache.get(cacheVotedKey) === 'true') {
+    throw new Error('このトークンは既に使用されています。（処理中）');
   }
 
-  try {
-    var cacheVotedKey = 'VOTED_' + token;
-    if (cache.get(cacheVotedKey)) {
-      throw new Error('このトークンは既に使用されています。（処理中）');
-    }
+  // シートで二重投票チェック（キャッシュ有効期限切れ後の保険）
+  var validation = _validateToken(token, settings);
+  if (!validation.valid) throw new Error(validation.message);
 
-    var validation = _validateToken(token, settings);
-    if (!validation.valid) throw new Error(validation.message);
-
-    cache.put(cacheVotedKey, 'true', 21600);
-
-    // Option C: カウンタを進めて個別キーに書き込むだけ。配列を持ち回さない。
-    var n = Number(cache.get('QUEUE_LEN') || '0');
-    var payload = { token: token, choices: choices, date: new Date().toISOString() };
-    cache.put('BUFFER_' + n, JSON.stringify(payload), 21600);
-    cache.put('QUEUE_LEN', String(n + 1), 21600);
-
-  } finally {
-    lock.releaseLock();
-  }
+  // トークンをキーとして投票データを格納。ロック不要。
+  // 同一トークンへの極めて稀な同時リクエストでも後着が上書きするだけで
+  // processVoteBuffer は 1 件として扱うため二重集計にならない。
+  var payload = JSON.stringify({ token: token, choices: choices, date: new Date().toISOString() });
+  cache.put('VOTE_' + token, payload, 21600);
+  cache.put(cacheVotedKey,   'true',  21600);
 }
 
 /**
@@ -655,51 +648,80 @@ function _deleteTriggersByName(functionName) {
 // =============================================================================
 
 /**
- * キャッシュに溜まったデータをスプレッドシートに一括書き込みする。
+ * キャッシュ（VOTE_{token}）に溜まったデータをスプレッドシートに一括書き込みする。
+ *
+ * ロックフリー設計に変更したため、processVoteBuffer 自体は 1 分トリガーで
+ * 複数インスタンスが重複起動しないよう ScriptLock を使う。
+ * ただし submit 側はロックを持たないので processVoteBuffer 実行中でも
+ * 新規投票を受け付け続けられる。
  */
 function processVoteBuffer() {
-  var cache = CacheService.getScriptCache();
   var lock = LockService.getScriptLock();
-
-  // ScriptLock はグローバルなので、このバッチが走っている間は新規 submit は待たされる。
-  // 1 分おきトリガー × 数秒で済む処理量という前提なので、ロックは全工程を通じて保持する。
+  // 二重実行を防ぐためのロック。submit 側とは独立している。
   if (!lock.tryLock(10000)) return;
 
   try {
-    var n = Number(cache.get('QUEUE_LEN') || '0');
-    if (n === 0) return;
+    var ss          = SpreadsheetApp.getActiveSpreadsheet();
+    var cache       = CacheService.getScriptCache();
+    var rosterSheet = ss.getSheetByName(SHEET_ROSTER);
+    var lastRow     = rosterSheet.getLastRow();
+    if (lastRow < 2) return;
 
-    var keys = [];
-    for (var i = 0; i < n; i++) keys.push('BUFFER_' + i);
+    // 名簿から「未投票（voted=FALSE）のトークン」を全件取得
+    var cols     = rosterSheet.getRange(2, COL_TOKEN, lastRow - 1, COL_VOTED - COL_TOKEN + 1).getValues();
+    var votedIdx = COL_VOTED - COL_TOKEN;
+    var pending  = [];   // { token, sheetRow }
+    for (var i = 0; i < cols.length; i++) {
+      var tok   = String(cols[i][0]).trim();
+      var voted = cols[i][votedIdx];
+      if (tok && !voted) pending.push({ token: tok, sheetRow: i + 2 });
+    }
+    if (pending.length === 0) return;
 
-    var cachedData = cache.getAll(keys) || {};
-    var ballotRows = [];
+    // キャッシュを 100 件ずつまとめて取得し、VOTE_{token} があるものを集める
+    var settings    = _getSettings();
+    var ballotRows  = [];
     var votedTokens = [];
+    var CHUNK       = 100;
 
-    for (var j = 0; j < keys.length; j++) {
-      var key = keys[j];
-      if (cachedData[key]) {
-        var data = JSON.parse(cachedData[key]);
-        var row = [new Date(data.date)].concat(data.choices);
-        ballotRows.push(row);
-        votedTokens.push(data.token);
+    for (var c = 0; c < pending.length; c += CHUNK) {
+      var chunk   = pending.slice(c, c + CHUNK);
+      var cacheKeys = chunk.map(function(p) { return 'VOTE_' + p.token; });
+      var hit     = cache.getAll(cacheKeys) || {};
+
+      for (var k = 0; k < chunk.length; k++) {
+        var cKey = 'VOTE_' + chunk[k].token;
+        if (!hit[cKey]) continue;
+        try {
+          var data = JSON.parse(hit[cKey]);
+          var row  = [new Date(data.date)];
+          for (var v = 0; v < settings.votes.length; v++) {
+            row.push(data.choices[v] || '');
+          }
+          ballotRows.push(row);
+          votedTokens.push(chunk[k].token);
+        } catch(parseErr) {
+          Logger.log('VOTE_ parse error: ' + parseErr.message);
+        }
       }
     }
 
-    // 取り出し済みなのでカウンタを 0 に戻し、個別キーも掃除する。
-    // ロックを保持したまま行うため、この間に新規 submit が入り込んで
-    // BUFFER_0 を上書きする心配はない。
-    cache.removeAll(keys);
-    cache.put('QUEUE_LEN', '0', 21600);
-
     if (ballotRows.length === 0) return;
 
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    // 投票箱シートに書き込む
     var ballotSheet = ss.getSheetByName(SHEET_BALLOT_BOX);
-    var startRow = ballotSheet.getLastRow() + 1;
+    var startRow    = ballotSheet.getLastRow() + 1;
     ballotSheet.getRange(startRow, 1, ballotRows.length, ballotRows[0].length).setValues(ballotRows);
 
+    // 名簿の投票済みフラグを更新
     _batchUpdateRosterVotedFlags(ss, votedTokens);
+
+    // キャッシュから VOTE_ エントリを削除
+    var removeKeys = votedTokens.map(function(t) { return 'VOTE_' + t; });
+    cache.removeAll(removeKeys);
+
+    SpreadsheetApp.flush();
+    Logger.log('[processVoteBuffer] ' + ballotRows.length + ' 件をシートに書き込みました。');
 
   } catch(e) {
     Logger.log('バッチ処理エラー: ' + e.message);
@@ -1330,52 +1352,54 @@ function processVoteBufferManual() {
  *   2. Apps Script エディタ → 「実行数」タブ → この関数のログを開く
  */
 function diagnoseCacheState() {
-  var cache = CacheService.getScriptCache();
-  var n     = Number(cache.get('QUEUE_LEN') || '0');
-
-  Logger.log('==============================');
-  Logger.log('キャッシュ診断レポート');
-  Logger.log('  QUEUE_LEN  : ' + n + ' 件');
-
-  if (n === 0) {
-    Logger.log('  → キャッシュは空です（フラッシュ済みか通常モード）');
-  } else {
-    // 先頭 5 件の内容をサンプル表示
-    var sampleKeys = [];
-    for (var i = 0; i < Math.min(n, 5); i++) sampleKeys.push('BUFFER_' + i);
-    var samples = cache.getAll(sampleKeys);
-    Logger.log('  先頭 ' + sampleKeys.length + ' 件のサンプル:');
-    for (var k in samples) {
-      try {
-        var obj = JSON.parse(samples[k]);
-        Logger.log('    ' + k + ': token=' + String(obj.token).substring(0, 8) + '... choices=' + JSON.stringify(obj.choices));
-      } catch (e) {
-        Logger.log('    ' + k + ': ' + samples[k]);
-      }
-    }
-  }
-
-  // 名簿の投票済みカウントも合わせて確認
   var ss          = SpreadsheetApp.getActiveSpreadsheet();
+  var cache       = CacheService.getScriptCache();
   var rosterSheet = ss.getSheetByName(SHEET_ROSTER);
   var lastRow     = rosterSheet.getLastRow();
-  var votedCount  = 0;
-  var totalCount  = 0;
+
+  // 名簿の集計
+  var totalCount = 0;
+  var votedCount = 0;
+  var pending    = [];   // 未投票のトークン一覧
+
   if (lastRow >= 2) {
-    var flags = rosterSheet.getRange(2, COL_VOTED, lastRow - 1, 1).getValues();
-    for (var f = 0; f < flags.length; f++) {
-      if (String(flags[f][0]).trim()) totalCount++;
-      if (flags[f][0] === true) votedCount++;
+    var cols     = rosterSheet.getRange(2, COL_TOKEN, lastRow - 1, COL_VOTED - COL_TOKEN + 1).getValues();
+    var votedIdx = COL_VOTED - COL_TOKEN;
+    for (var i = 0; i < cols.length; i++) {
+      var tok   = String(cols[i][0]).trim();
+      var voted = cols[i][votedIdx];
+      if (!tok) continue;
+      totalCount++;
+      if (voted === true) { votedCount++; } else { pending.push(tok); }
     }
   }
-  Logger.log('  名簿: 全 ' + totalCount + ' 行 / 投票済み(TRUE): ' + votedCount + ' 行 / 未投票(FALSE): ' + (totalCount - votedCount) + ' 行');
+
+  // 未投票トークンのうち VOTE_{token} がキャッシュにある件数を確認
+  var cachedCount = 0;
+  var CHUNK = 100;
+  for (var c = 0; c < pending.length; c += CHUNK) {
+    var chunk = pending.slice(c, c + CHUNK);
+    var keys  = chunk.map(function(t) { return 'VOTE_' + t; });
+    var hit   = cache.getAll(keys) || {};
+    cachedCount += Object.keys(hit).length;
+  }
+
+  Logger.log('==============================');
+  Logger.log('キャッシュ診断レポート（ロックフリー方式）');
+  Logger.log('  名簿: 全 ' + totalCount + ' 行');
+  Logger.log('  投票済み (TRUE): ' + votedCount + ' 行');
+  Logger.log('  未投票  (FALSE): ' + pending.length + ' 行');
+  Logger.log('  うちキャッシュ待ち: ' + cachedCount + ' 件（次の processVoteBuffer でシートに反映）');
+  Logger.log('  未キャッシュ（未投票）: ' + (pending.length - cachedCount) + ' 件');
   Logger.log('==============================');
 
   SpreadsheetApp.getUi().alert(
     'キャッシュ診断結果\n\n' +
-    'キャッシュ内未書込み件数: ' + n + ' 件\n' +
-    '名簿の投票済み(TRUE): ' + votedCount + ' 行\n' +
-    '名簿の未投票(FALSE): ' + (totalCount - votedCount) + ' 行\n\n' +
+    '名簿の全行数: ' + totalCount + ' 行\n' +
+    '投票済み (TRUE): ' + votedCount + ' 行\n' +
+    '未投票 (FALSE): ' + pending.length + ' 行\n\n' +
+    '　うちキャッシュ待ち（次回フラッシュで反映）: ' + cachedCount + ' 件\n' +
+    '　まだ投票していない: ' + (pending.length - cachedCount) + ' 件\n\n' +
     '詳細は Apps Script エディタの「実行数」タブでログを確認してください。'
   );
 }
