@@ -604,10 +604,34 @@ function setupTrigger() {
 }
 
 function startVotingTrigger() {
+  var settings     = _getSettings();
   var functionName = 'processVoteBuffer';
+
+  // 既存トリガーをリセット
   _deleteTriggersByName(functionName);
   ScriptApp.newTrigger(functionName).timeBased().everyMinutes(1).create();
-  SpreadsheetApp.getUi().alert('【投票開始】\n1分おきのバッチ処理トリガーをセットしました。\n終了後は「⏹ 投票終了」を実行してください。');
+
+  // 締め切り未設定の場合: 48 時間後に自動でトリガー停止する一回限りのタイマーをセット
+  _deleteTriggersByName('_autoStopVoting');  // 二重登録を防ぐ
+  if (!settings.deadline) {
+    ScriptApp.newTrigger('_autoStopVoting')
+      .timeBased()
+      .after(48 * 60 * 60 * 1000)   // 48 時間後（ミリ秒）
+      .create();
+    SpreadsheetApp.getUi().alert(
+      '【投票開始】\n' +
+      '1分おきのバッチ処理トリガーをセットしました。\n\n' +
+      '⚠ 締め切り日時が未設定のため、\n' +
+      '投票開始から 48 時間後に自動的にトリガーを停止します。\n\n' +
+      '手動で終了する場合は「⏹ 投票終了」を実行してください。'
+    );
+  } else {
+    SpreadsheetApp.getUi().alert(
+      '【投票開始】\n' +
+      '1分おきのバッチ処理トリガーをセットしました。\n' +
+      '終了後は「⏹ 投票終了」を実行してください。'
+    );
+  }
 }
 
 function stopVotingTrigger() {
@@ -617,7 +641,39 @@ function stopVotingTrigger() {
     return;
   }
   _deleteTriggersByName('processVoteBuffer');
+  // 手動停止時は 48 時間自動停止タイマーも合わせて削除
+  _deleteTriggersByName('_autoStopVoting');
   try { SpreadsheetApp.getUi().alert('【投票終了】\nバッチ処理トリガーを停止しました。'); } catch (e) {}
+}
+
+/**
+ * 締め切り未設定時に startVotingTrigger から 48 時間後に自動呼び出されるハンドラ。
+ * processVoteBuffer を最後に一度だけ実行してキャッシュを全フラッシュしてから停止する。
+ */
+function _autoStopVoting() {
+  // 残存キャッシュを書き込んでから停止
+  try { processVoteBuffer(); } catch (e) { Logger.log('autoStop flush error: ' + e.message); }
+
+  _deleteTriggersByName('processVoteBuffer');
+  _deleteTriggersByName('_autoStopVoting');
+
+  Logger.log('【自動停止】投票開始から 48 時間が経過したため、バッチ処理トリガーを停止しました。');
+
+  // 主催者への通知メール（設定済みの場合のみ）
+  try {
+    var settings = _getSettings();
+    if (settings.organizerEmails && settings.organizerEmails.length > 0) {
+      var subject = '【Votely】投票が自動終了しました';
+      var body    =
+        '投票開始から 48 時間が経過したため、自動的に投票を終了しました。\n\n' +
+        '集計・結果通知を行う場合は、スプレッドシートのメニューから\n' +
+        '「⑤ 集計・結果通知（手動実行）」を実行してください。\n\n' +
+        '— Votely 自動通知';
+      MailApp.sendEmail(settings.organizerEmails[0], subject, body);
+    }
+  } catch (mailErr) {
+    Logger.log('autoStop mail error: ' + mailErr.message);
+  }
 }
 
 /**
