@@ -10,7 +10,9 @@ Google API・認証設定は不要。
 import io
 import json
 import os
+import platform
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -512,6 +514,15 @@ class VotelyApp(tk.Tk):
                 os.startfile(path)
             elif sys.platform == 'darwin':
                 subprocess.Popen(['open', path])
+            elif 'microsoft' in platform.uname().release.lower() or os.path.exists('/proc/sys/fs/binfmt_misc/WSL'):
+                # WSL環境: Windowsホストの関連付けを呼び出す
+                if shutil.which('wslview'):
+                    subprocess.Popen(['wslview', path])
+                else:
+                    subprocess.Popen([
+                        'cmd.exe', '/c', 'start', '',
+                        path.replace('/', '\\'),
+                    ])
             else:
                 subprocess.Popen(['xdg-open', path])
         except Exception as e:

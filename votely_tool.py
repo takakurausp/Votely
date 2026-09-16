@@ -88,6 +88,22 @@ def save_config(cfg: dict):
 # コア機能
 # =============================================================================
 
+# メールアドレスの基本形式検証（RFC 5322 の完全準拠は過剰なので簡易版）
+_EMAIL_RE = re.compile(
+    r'^[a-zA-Z0-9.!#$%&\'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?'
+    r'(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$'
+)
+
+def _is_valid_email(email: str) -> bool:
+    """メールアドレスの基本形式を検証する。空文字や @ がない場合は False。"""
+    if not email or email.count('@') != 1:
+        return False
+    local, domain = email.rsplit('@', 1)
+    if not local or len(local) > 64 or not domain or '.' not in domain:
+        return False
+    return bool(_EMAIL_RE.match(email))
+
+
 def generate_tokens(input_csv: str, pages_url: str, output_csv: str) -> int:
     """
     メールアドレス CSV を読み込み、各行にトークンと投票 URL を付与して
@@ -97,9 +113,9 @@ def generate_tokens(input_csv: str, pages_url: str, output_csv: str) -> int:
     出力 CSV: メールアドレス, トークン, 投票用URL, 投票済みフラグ
     """
     base = pages_url.rstrip('/')
-
     # ── 入力 CSV 読み込み ─────────────────────────────────────────────────────
     emails: list[str] = []
+    skipped: list[str] = []
     with open(input_csv, encoding='utf-8-sig', newline='') as f:
         reader = csv.reader(f)
         for i, row in enumerate(reader):
@@ -110,7 +126,15 @@ def generate_tokens(input_csv: str, pages_url: str, output_csv: str) -> int:
             if i == 0 and email.lower() in ('メールアドレス', 'email', 'mail', 'e-mail'):
                 continue
             if email:
-                emails.append(email)
+                if _is_valid_email(email):
+                    emails.append(email)
+                else:
+                    skipped.append(email)
+    if skipped:
+        print(f'[警告] {len(skipped)} 件の無効メールアドレスをスキップしました:')
+        for s in skipped:
+            print(f'  - {s}')
+
 
     if not emails:
         print('[エラー] メールアドレスが 1 件も見つかりませんでした。')

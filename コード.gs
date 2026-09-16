@@ -144,6 +144,7 @@ function initializeSystem() {
   if (defaultSheet && ss.getSheets().length > 1) ss.deleteSheet(defaultSheet);
 
   ui.alert('Votelyのデータベース構築が完了しました！\n\n設定シートのB列に値を入力してください。\nB6セルで「通常モード」と「高速モード」を切り替えられます。');
+  _clearSettingsCache();
 }
 
 // =============================================================================
@@ -222,6 +223,7 @@ function generateTokensAndSendEmails() {
     }
   }
   ui.alert(sentCount + ' 件のアドレスにトークンを生成し、案内メールを送信しました。');
+  _clearSettingsCache();
 }
 
 /**
@@ -246,6 +248,7 @@ function generateTokensOnly() {
   SpreadsheetApp.getUi().alert(
     genCount + ' 件のトークンとURLを生成しました。\n「名簿とトークン」シートをご確認ください。'
   );
+  _clearSettingsCache();
 }
 
 // =============================================================================
@@ -324,6 +327,7 @@ function registerAttendee(email, password) {
   } catch (mailErr) {
     return { success: true, url: voteUrl, message: '登録完了。メール送信失敗のためURLを直接お伝えください。' };
   }
+  _clearSettingsCache();
   return { success: true, url: voteUrl, message: '登録完了。案内メールを送信しました。' };
 }
 
@@ -495,6 +499,7 @@ function tallySendResults() {
     return;
   }
 
+  try {
   var settings    = _getSettings();
   var ballotSheet = ss.getSheetByName(SHEET_BALLOT_BOX);
   var lastRow     = ballotSheet.getLastRow();
@@ -573,6 +578,11 @@ function tallySendResults() {
       : '集計・結果通知が完了しました。\n\n' + body;
     SpreadsheetApp.getUi().alert(doneMsg);
   } catch (e) {}
+  } catch (err) {
+    Logger.log('集計エラー: ' + err.message);
+    Logger.log(err.stack || err);
+    try { SpreadsheetApp.getUi().alert('集計中にエラーが発生しました: ' + err.message); } catch (e) {}
+  }
 }
 
 // =============================================================================
@@ -1022,11 +1032,62 @@ function _buildGuestTicketsDialogHtml() {
 // ユーティリティ（内部関数）
 // =============================================================================
 
+// ---- 設定キャッシュ ----
+var SETTINGS_CACHE_KEY = 'VOTELY_SETTINGS_CACHE';
+var SETTINGS_CACHE_TTL = 300;  // 5分
+
+/**
+ * 設定をキャッシュから読み込む。CacheService に存在すれば
+ * スプレッドシート API 呼び出しを回避できる。
+ * @returns {{cached: boolean, settings: ?Object}}
+ */
+function _readCachedSettings() {
+  var cache = CacheService.getScriptCache();
+  var raw = cache.get(SETTINGS_CACHE_KEY);
+  if (!raw) return { cached: false, settings: null };
+  try {
+    return { cached: true, settings: JSON.parse(raw) };
+  } catch (e) {
+    cache.remove(SETTINGS_CACHE_KEY);
+    return { cached: false, settings: null };
+  }
+}
+
+/**
+ * 設定をキャッシュに保存する。
+ */
+function _writeCachedSettings(settings) {
+  var cache = CacheService.getScriptCache();
+  try {
+    cache.put(SETTINGS_CACHE_KEY, JSON.stringify(settings), SETTINGS_CACHE_TTL);
+  } catch (e) {
+    // 100KB 制限超過などで失敗した場合は黙殻（キャッシュなしでフォールバック）
+  }
+}
+
+/**
+ * 設定キャッシュをクリアする。
+ * 設定変更後やトークン生成後に呼ぶ。
+ */
+function _clearSettingsCache() {
+  CacheService.getScriptCache().remove(SETTINGS_CACHE_KEY);
+}
+
+/**
+ * 設定を取得する（キャッシュ対応）。
+ * 設定シートのレイアウト:
+ *   A 列 = 項目名（ラベル、読み飛ばす）
+ *   B 列 = 設定値（B1〜B6 をそれぞれ読む）
+ *   C 列以降 = 投票項目（行1: タイトル、行2以降: 選択肢）
+ */
 function _getSettings() {
-  // 設定シートのレイアウト:
-  //   A 列 = 項目名（ラベル、読み飛ばす）
-  //   B 列 = 設定値（B1〜B6 をそれぞれ読む）
-  //   C 列以降 = 投票項目（行1: タイトル、行2以降: 選択肢）
+  // キャッシュを試行
+  var cached = _readCachedSettings();
+  if (cached.cached && cached.settings) {
+    return cached.settings;
+  }
+
+  // キャッシュヒットせず：スプレッドシートから読み込み
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_SETTINGS);
   var organizerEmails = _parseEmails(sheet.getRange('B1').getValue());
   var deadline        = sheet.getRange('B2').getValue();
@@ -1054,7 +1115,7 @@ function _getSettings() {
     col++;
   }
 
-  return {
+  var settings = {
     organizerEmails: organizerEmails,
     deadline:        deadline,
     adminPassword:   adminPassword,
@@ -1063,6 +1124,11 @@ function _getSettings() {
     mode:            mode,
     votes:           votes
   };
+
+  // キャッシュに保存
+  _writeCachedSettings(settings);
+
+  return settings;
 }
 
 function _generateUUID() {
@@ -1265,6 +1331,7 @@ function importTokenCsv(csvText) {
     rosterSheet.getRange(last + 1, 1, newRows.length, 4).setValues(newRows);
   }
   SpreadsheetApp.flush();
+  _clearSettingsCache();
 
   return { updated: updated, added: added };
 }
@@ -1382,15 +1449,40 @@ function _parseCsv(text) {
  */
 function processVoteBufferManual() {
   var ui = SpreadsheetApp.getUi();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
   var cache = CacheService.getScriptCache();
-  var n = Number(cache.get('QUEUE_LEN') || '0');
-  if (n === 0) {
+
+  // QUEUE_LEN キーは旧実装の名残り — 新しいロックフリー方式では
+  // VOTE_{token} 個別キーを使用するため、実際の残数は
+  // 名簿の未投票トークンに対する VOTE_ キーの存在確認で求める。
+  var rosterSheet = ss.getSheetByName(SHEET_ROSTER);
+  var lastRow = rosterSheet.getLastRow();
+  var cachedCount = 0;
+  if (lastRow >= 2) {
+    var cols = rosterSheet.getRange(2, COL_TOKEN, lastRow - 1, COL_VOTED - COL_TOKEN + 1).getValues();
+    var votedIdx = COL_VOTED - COL_TOKEN;
+    var pending = [];
+    for (var i = 0; i < cols.length; i++) {
+      var tok = String(cols[i][0]).trim();
+      var voted = cols[i][votedIdx];
+      if (tok && !voted) pending.push(tok);
+    }
+    var CHUNK = 100;
+    for (var c = 0; c < pending.length; c += CHUNK) {
+      var chunk = pending.slice(c, c + CHUNK);
+      var keys = chunk.map(function(t) { return 'VOTE_' + t; });
+      var hit = cache.getAll(keys) || {};
+      cachedCount += Object.keys(hit).length;
+    }
+  }
+
+  if (cachedCount === 0) {
     ui.alert('キャッシュは空です。書き込む投票データがありません。\n（すでにフラッシュ済みか、通常モードで運用中の可能性があります）');
     return;
   }
   var ans = ui.alert(
     '手動フラッシュの確認',
-    'キャッシュに ' + n + ' 件の投票データがあります。今すぐシートに書き込みますか？',
+    'キャッシュに ' + cachedCount + ' 件の投票データがあります。今すぐシートに書き込みますか？',
     ui.ButtonSet.YES_NO
   );
   if (ans !== ui.Button.YES) return;
