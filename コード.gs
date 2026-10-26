@@ -513,7 +513,7 @@ function tallySendResults() {
   var numVotes = settings.votes.length;
   var tallies = settings.votes.map(function(vote) {
     var t = {};
-    vote.options.forEach(function(opt) { t[opt] = 0; });
+    vote.options.forEach(function(opt) { t[_optionText(opt)] = 0; });
     return t;
   });
 
@@ -1079,6 +1079,7 @@ function _clearSettingsCache() {
  *   A 列 = 項目名（ラベル、読み飛ばす）
  *   B 列 = 設定値（B1〜B6 をそれぞれ読む）
  *   C 列以降 = 投票項目（行1: タイトル、行2以降: 選択肢）
+ *   選択肢は { text, html } で保持する（文字の一部の斜体を html に反映）。
  */
 function _getSettings() {
   // キャッシュを試行
@@ -1106,10 +1107,8 @@ function _getSettings() {
 
     var options = [];
     for (var r = 2; r <= maxRow; r++) {
-      var val = sheet.getRange(r, col).getValue();
-      if (val !== '' && val !== null && val !== undefined) {
-        options.push(String(val));
-      }
+      var option = _optionFromCell(sheet.getRange(r, col));
+      if (option) options.push(option);
     }
     if (options.length > 0) votes.push({ title: String(title), options: options });
     col++;
@@ -1129,6 +1128,67 @@ function _getSettings() {
   _writeCachedSettings(settings);
 
   return settings;
+}
+
+/**
+ * 設定シートの選択肢セルを { text, html } に変換する。
+ * - text: 投票値・集計キーに使うプレーンテキスト
+ * - html: 投票画面のラベル用。斜体部分だけ <i> で囲み、それ以外はエスケープ済み
+ * セル全体の斜体（セル書式）と、一部だけの斜体（リッチテキスト）の両方に対応する。
+ * 数式・数値などリッチテキストを持たないセルは getValue() にフォールバックする。
+ */
+function _optionFromCell(cell) {
+  var richText = null;
+  try {
+    richText = cell.getRichTextValue();
+  } catch (e) {
+    richText = null;
+  }
+
+  if (!richText) {
+    var plain = cell.getValue();
+    if (plain === '' || plain === null || plain === undefined) return null;
+    var plainText = String(plain);
+    return { text: plainText, html: _escapeHtml(plainText) };
+  }
+
+  var text = richText.getText();
+  if (!text) return null;
+
+  var cellItalic = false;
+  try {
+    cellItalic = String(cell.getFontStyle()).toLowerCase() === 'italic';
+  } catch (e2) {
+    cellItalic = false;
+  }
+
+  var html = richText.getRuns().map(function(run) {
+    var escaped = _escapeHtml(run.getText());
+    var runItalic = run.getTextStyle().isItalic();
+    if (runItalic === null || runItalic === undefined) runItalic = cellItalic;
+    return runItalic ? '<i>' + escaped + '</i>' : escaped;
+  }).join('');
+
+  return { text: text, html: html };
+}
+
+/**
+ * 選択肢オブジェクト（または旧形式の文字列）からプレーンテキストを取り出す。
+ */
+function _optionText(option) {
+  return (option && typeof option === 'object') ? String(option.text) : String(option);
+}
+
+/**
+ * HTML エスケープ。
+ */
+function _escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
 }
 
 function _generateUUID() {

@@ -113,9 +113,12 @@ function buildForm(s) {
   container.innerHTML = '';
   (s.votes || []).forEach(function(vote, vIdx) {
     var optionsHtml = (vote.options || []).map(function(opt, oIdx) {
+      // 新形式は { text, html }。旧形式（文字列）も後方互換で受け付ける。
+      var optText  = (opt && typeof opt === 'object') ? String(opt.text) : String(opt);
+      var optLabel = (opt && typeof opt === 'object' && opt.html) ? opt.html : escapeHtml(optText);
       return '<div class="form-check">' +
-        '<input class="form-check-input" type="radio" name="vote_' + vIdx + '" id="v' + vIdx + '_' + oIdx + '" value="' + escapeHtml(opt) + '">' +
-        '<label class="form-check-label" for="v' + vIdx + '_' + oIdx + '">' + escapeHtml(opt) + '</label>' +
+        '<input class="form-check-input" type="radio" name="vote_' + vIdx + '" id="v' + vIdx + '_' + oIdx + '" value="' + escapeHtml(optText) + '">' +
+        '<label class="form-check-label" for="v' + vIdx + '_' + oIdx + '">' + optLabel + '</label>' +
         '</div>';
     }).join('');
     container.innerHTML +=

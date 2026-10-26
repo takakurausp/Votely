@@ -141,13 +141,16 @@ function buildForm(s) {
   (s.votes || []).forEach(function(vote, vIdx) {
     var hrHtml = vIdx > 0 ? '<hr class="my-4">' : '';
     var optionsHtml = (vote.options || []).map(function(opt, oIdx) {
+      // 新形式は { text, html }。旧形式（文字列）も後方互換で受け付ける。
+      var optText  = (opt && typeof opt === 'object') ? String(opt.text) : String(opt);
+      var optLabel = (opt && typeof opt === 'object' && opt.html) ? opt.html : escapeHtml(optText);
       return (
         '<div class="form-check">' +
           '<input class="form-check-input" type="radio"' +
           ' name="vote_' + vIdx + '" id="vote_' + vIdx + '_' + oIdx + '"' +
-          ' value="' + escapeHtml(opt) + '">' +
+          ' value="' + escapeHtml(optText) + '">' +
           '<label class="form-check-label" for="vote_' + vIdx + '_' + oIdx + '">' +
-            escapeHtml(opt) +
+            optLabel +
           '</label>' +
         '</div>'
       );
