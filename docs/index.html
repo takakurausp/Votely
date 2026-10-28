@@ -41,6 +41,10 @@
       </div>
 
       <div id="state-form">
+        <div id="test-mode-banner" class="alert alert-warning small mb-3" style="display:none;" role="alert">
+          <strong>🧪 テスト投票モード</strong><br>
+          この送信は得票数にカウントされません。投票の流れを確認するためのものです。
+        </div>
         <p class="text-muted small mb-3">締め切り: <strong id="deadline-display"></strong></p>
         <div id="vote-sections"></div>
         <div class="d-grid mt-3">
@@ -60,8 +64,8 @@
                class="bi bi-check-circle-fill mb-3" viewBox="0 0 16 16">
             <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/>
           </svg>
-          <h4 class="text-success">投票が完了しました</h4>
-          <p class="text-muted mt-2">ご参加ありがとうございました。<br>このページを閉じていただいて構いません。</p>
+          <h4 class="text-success" id="done-title">投票が完了しました</h4>
+          <p class="text-muted mt-2" id="done-message">ご参加ありがとうございました。<br>このページを閉じていただいて構いません。</p>
         </div>
       </div>
 
@@ -73,6 +77,8 @@
 <script>
 // URLパラメータからトークンを取得
 var TOKEN = new URLSearchParams(window.location.search).get('token') || '';
+// サーバーがテスト投票と判定した場合に true になる（得票数にはカウントされない）
+var TEST_MODE = false;
 
 var STATES = ['loading', 'error', 'form', 'submitting', 'done'];
 function showState(s) {
@@ -101,7 +107,12 @@ window.addEventListener('load', function() {
   gasPost({ action: 'getVoteFormData', token: TOKEN })
     .then(function(result) {
       if (!result.valid) { showError(result.message); return; }
+      TEST_MODE = !!result.testMode;
       buildForm(result.settings);
+      if (TEST_MODE) {
+        document.getElementById('test-mode-banner').style.display = 'block';
+        document.getElementById('submit-btn').textContent = 'テスト投票する';
+      }
       showState('form');
     })
     .catch(function(err) { showError('サーバーとの通信に失敗しました: ' + err.message); });
@@ -147,8 +158,12 @@ function onSubmit() {
   showState('submitting');
   gasPost({ action: 'submitVote', token: TOKEN, choices: choices })
     .then(function(result) {
-      if (result.success) showState('done');
-      else showError(result.message);
+      if (!result.success) { showError(result.message); return; }
+      if (result.testMode) {
+        document.getElementById('done-title').textContent = 'テスト投票が完了しました';
+        document.getElementById('done-message').innerHTML = '得票数にはカウントされていません。<br>このまま本番の投票を開始できます。';
+      }
+      showState('done');
     })
     .catch(function(err) { showError('送信に失敗しました: ' + err.message); });
 }

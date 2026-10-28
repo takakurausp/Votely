@@ -15,6 +15,11 @@ var COL_TOKEN = 2; // B列: トークン
 var COL_URL   = 3; // C列: 投票用URL
 var COL_VOTED = 4; // D列: 投票済みフラグ
 
+// ---- テスト投票 ----
+// 名簿に登録しなくても使える特別なトークン。設置直後の動作確認用。
+// 投票内容はスプレッドシートにもキャッシュにも書かれず、集計に一切影響しない。
+var TEST_TOKEN = 'test';
+
 // =============================================================================
 // メニュー登録
 // =============================================================================
@@ -37,6 +42,8 @@ function onOpen() {
     .addItem('⑥ 締め切りトリガーをセットアップ', 'setupTrigger')
     .addSeparator()
     .addItem('⑦ 🎫 当日参加者用チケット一括発行（PDF印刷）', 'generateGuestTickets')
+    .addSeparator()
+    .addItem('🧪 テスト投票URLを表示（得票数にはカウントされません）', 'showTestVoteUrl')
     .addSeparator()
     .addItem('⑧ 📥 メールアドレスを CSV エクスポート', 'exportRosterCsv')
     .addItem('⑨ 📤 トークン CSV をインポート',          'showImportTokenCsvDialog')
@@ -252,6 +259,34 @@ function generateTokensOnly() {
 }
 
 // =============================================================================
+// 機能A-2: テスト投票（設置後の動作確認用・得票数にはカウントされない）
+// =============================================================================
+
+/**
+ * テスト投票用のURLをダイアログに表示する。
+ * 名簿のトークンは消費せず、投票内容も一切記録されない。
+ */
+function showTestVoteUrl() {
+  var settings = _getSettings();
+  var base     = String(settings.pagesUrl || settings.appUrl || '').replace(/\/$/, '');
+  var message;
+
+  if (base) {
+    message = 'テスト投票用のURLです。\n\n' +
+              base + '/index.html?token=' + TEST_TOKEN + '\n\n' +
+              '・投票の流れ（画面表示 → 送信 → 完了）を確認できます。\n' +
+              '・得票数や投票済みフラグには一切影響しません（何度でも実行できます）。\n' +
+              '・締め切り日時を過ぎていても実行できます。';
+  } else {
+    message = '設定シートの B5（または B4）に投票画面URLが設定されていません。\n' +
+              '設定後にこのメニューをもう一度実行してください。\n\n' +
+              'URLの形式: <投票画面URL>/index.html?token=' + TEST_TOKEN;
+  }
+
+  SpreadsheetApp.getUi().alert('🧪 テスト投票', message, SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+// =============================================================================
 // 機能B: 事務局ポータル
 // =============================================================================
 
@@ -336,7 +371,27 @@ function registerAttendee(email, password) {
 // =============================================================================
 
 function getVoteFormData(token) {
-  var settings = _getSettings();
+  var settings    = _getSettings();
+  var deadlineStr = settings.deadline
+    ? Utilities.formatDate(new Date(settings.deadline), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm')
+    : '';
+
+  // テスト投票: 名簿・締め切りに関係なくフォームを返す（投票内容は記録しない）
+  if (_isTestToken(token)) {
+    if (!settings.votes || settings.votes.length === 0) {
+      return { valid: false, message: '投票項目が設定されていません。設定シートのC列以降に投票項目を入力してください。', settings: null };
+    }
+    return {
+      valid:    true,
+      testMode: true,
+      message:  'テスト投票モードです（得票数にはカウントされません）。',
+      settings: {
+        votes:    settings.votes,
+        deadline: deadlineStr
+      }
+    };
+  }
+
   var validation = _validateToken(token, settings);
   if (!validation.valid) {
     return { valid: false, message: validation.message, settings: null };
@@ -347,7 +402,7 @@ function getVoteFormData(token) {
     message: 'OK',
     settings: {
       votes:    settings.votes,
-      deadline: settings.deadline ? Utilities.formatDate(new Date(settings.deadline), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm') : ''
+      deadline: deadlineStr
     }
   };
 }
@@ -358,6 +413,16 @@ function getVoteFormData(token) {
 function submitVote(token, choices) {
   try {
     var settings = _getSettings();
+
+    // テスト投票: 何も記録せずに成功を返す（得票数・投票済みフラグに影響しない）
+    if (_isTestToken(token)) {
+      _validateChoices(choices, settings);
+      return {
+        success:  true,
+        testMode: true,
+        message:  'テスト投票を受け付けました（得票数にはカウントされません）。'
+      };
+    }
 
     // 設定シートB6の値によって処理を切り替え
     if (settings.mode === '高速モード') {
@@ -373,14 +438,28 @@ function submitVote(token, choices) {
 }
 
 /**
- * 【通常モード】スプレッドシートに直接書き込む。小・中規模向け。
+ * テスト投票用トークン（TEST_TOKEN）かどうかを判定する。
  */
-function _recordVoteDirect(token, choices, settings) {
+function _isTestToken(token) {
+  return String(token || '').trim().toLowerCase() === TEST_TOKEN;
+}
+
+/**
+ * すべての投票項目で選択肢が選ばれているか検証する。
+ */
+function _validateChoices(choices, settings) {
   for (var v = 0; v < settings.votes.length; v++) {
-    if (!choices[v] || choices[v] === '') {
+    if (!choices || !choices[v] || choices[v] === '') {
       throw new Error('「' + settings.votes[v].title + '」の選択肢を選んでください。');
     }
   }
+}
+
+/**
+ * 【通常モード】スプレッドシートに直接書き込む。小・中規模向け。
+ */
+function _recordVoteDirect(token, choices, settings) {
+  _validateChoices(choices, settings);
 
   var ss          = SpreadsheetApp.getActiveSpreadsheet();
   var rosterSheet = ss.getSheetByName(SHEET_ROSTER);
@@ -425,11 +504,7 @@ function _recordVoteDirect(token, choices, settings) {
  * VOTE_{token} の存在を確認する方式に変更している。
  */
 function _recordVoteCache(token, choices, settings) {
-  for (var v = 0; v < settings.votes.length; v++) {
-    if (!choices[v] || choices[v] === '') {
-      throw new Error('「' + settings.votes[v].title + '」の選択肢を選んでください。');
-    }
-  }
+  _validateChoices(choices, settings);
 
   var cache = CacheService.getScriptCache();
 
