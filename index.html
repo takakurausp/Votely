@@ -30,7 +30,7 @@
 <body>
 <div class="container py-4">
   <div class="card vote-card">
-      <div class="card-header">Votely &mdash; 投票画面</div>
+      <div class="card-header" id="app-title">Votely &mdash; 投票画面</div>
     <div class="card-body p-4">
 
       <div id="state-loading" class="text-center py-5">
@@ -117,6 +117,14 @@ function showError(msg) {
   showState('error');
 }
 
+// 見出しをスプレッドシート名にする（取得できない場合はHTMLの既定文言のまま）
+function applyTitle(title) {
+  var name = String(title || '').trim();
+  if (!name) return;
+  document.getElementById('app-title').textContent = name;
+  document.title = name;
+}
+
 // ---- 初期化 ----
 window.addEventListener('load', function() {
   showState('loading');
@@ -124,6 +132,7 @@ window.addEventListener('load', function() {
     .then(function(result) {
       if (!result.valid) { showError(result.message); return; }
       TEST_MODE = !!result.testMode;
+      applyTitle(result.settings && result.settings.title);
       buildForm(result.settings);
       if (TEST_MODE) {
         document.getElementById('test-mode-banner').style.display = 'block';

@@ -395,6 +395,7 @@ function getVoteFormData(token) {
       testMode: true,
       message:  'テスト投票モードです（得票数にはカウントされません）。',
       settings: {
+        title:    _getSpreadsheetTitle(),
         votes:    settings.votes,
         deadline: deadlineStr
       }
@@ -410,10 +411,22 @@ function getVoteFormData(token) {
     valid:   true,
     message: 'OK',
     settings: {
+      title:    _getSpreadsheetTitle(),
       votes:    settings.votes,
       deadline: deadlineStr
     }
   };
+}
+
+/**
+ * 投票画面の見出しに使うスプレッドシート名を返す。取得できなければ空文字。
+ */
+function _getSpreadsheetTitle() {
+  try {
+    return String(SpreadsheetApp.getActiveSpreadsheet().getName() || '').trim();
+  } catch (err) {
+    return '';
+  }
 }
 
 /**
