@@ -97,8 +97,6 @@ function initializeSystem() {
     settingsSheet.getRange('A1').setNote('【必須】結果通知先のメールアドレス。複数の場合はカンマ区切り。2件目以降はBCCで送信されます。');
     settingsSheet.getRange('A2').setNote('【任意】例: 2026/04/10 12:00。空欄の場合は締切なしで運用できます。');
     settingsSheet.getRange('A3').setNote('【必須】当日参加者登録 (admin.html) で使用するパスワード。');
-    settingsSheet.getRange('A4').setNote('【必須】GASをデプロイして取得した「ウェブアプリのURL」。設定後に「⑦ デプロイ」ステップで埋めます。');
-    settingsSheet.getRange('A5').setNote('【必須】GitHub Pages 等で公開した投票画面のベースURL（末尾スラッシュなし）。');
     settingsSheet.getRange('A6').setNote('【必須】「通常モード」または「高速モード」をプルダウンから選択してください。');
 
     // B 列：値（初期値は B6 だけ「通常モード」を入れておく）
@@ -121,6 +119,17 @@ function initializeSystem() {
     .setHelpText('通常モード（小〜中規模）または 高速モード（大規模一斉投票）を選択してください。')
     .build();
   settingsSheet.getRange('B6').setDataValidation(modeRule);
+
+  // A4 / A5 ノート（B4 = GAS URL、B5 = フロントエンドURL）:
+  // 旧文言が残っている既存シートも含めて毎回そろえる。
+  settingsSheet.getRange('A4').setNote(
+    '【任意】GASエディタの「デプロイ → 新しいデプロイ」で取得したウェブアプリURL（例: https://script.google.com/macros/s/XXXXXXXXXXXXXXXX/exec）。' +
+    'B5が未設定のときのフォールバックとして使われます。'
+  );
+  settingsSheet.getRange('A5').setNote(
+    '【必須】GitHub Pages 等で公開した投票画面のベースURL（例: https://user.github.io/repo）。' +
+    '末尾の「/」は付いていても自動で削除されます。'
+  );
 
   // 2. 名簿とトークンシート
   var rosterSheet = getOrCreateSheet(SHEET_ROSTER);
@@ -1121,7 +1130,12 @@ function _readCachedSettings() {
   var raw = cache.get(SETTINGS_CACHE_KEY);
   if (!raw) return { cached: false, settings: null };
   try {
-    return { cached: true, settings: JSON.parse(raw) };
+    var settings = JSON.parse(raw);
+    // 旧バージョンで保存されたキャッシュに末尾「/」付きの URL が残っていても揃える
+    if (settings && typeof settings.pagesUrl === 'string') {
+      settings.pagesUrl = _normalizeBaseUrl(settings.pagesUrl);
+    }
+    return { cached: true, settings: settings };
   } catch (e) {
     cache.remove(SETTINGS_CACHE_KEY);
     return { cached: false, settings: null };
@@ -1169,7 +1183,7 @@ function _getSettings() {
   var deadline        = sheet.getRange('B2').getValue();
   var adminPassword   = sheet.getRange('B3').getValue();
   var appUrl          = _normalizeAppUrl(String(sheet.getRange('B4').getValue()).trim());
-  var pagesUrl        = String(sheet.getRange('B5').getValue()).trim();
+  var pagesUrl        = _normalizeBaseUrl(sheet.getRange('B5').getValue());
   var mode            = String(sheet.getRange('B6').getValue()).trim() || '通常モード';
 
   var maxRow = sheet.getLastRow();
@@ -1301,6 +1315,16 @@ function _sendInvitationEmail(email, voteUrl, settings) {
     '※ 投票は匿名で処理されます（誰が何に投票したかは記録されません）。'
   ].join('\n');
   MailApp.sendEmail({ to: email, subject: subject, body: body });
+}
+
+/**
+ * 投票画面URL（設定シートの B5）用の正規化。
+ * 前後の空白を除去し、末尾の「/」は自動で削除する
+ * （B5 は末尾スラッシュなしで入力する想定だが、付いていても動くようにする）。
+ */
+function _normalizeBaseUrl(url) {
+  if (url === null || url === undefined) return '';
+  return String(url).trim().replace(/\/+$/, '');
 }
 
 function _normalizeAppUrl(url) {
